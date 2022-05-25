@@ -152,6 +152,7 @@ require (
 )
 
 require (
+	github.com/edsrzf/mmap-go v1.1.0
 	github.com/pulumi/pulumi-java/pkg v0.2.0
 	github.com/pulumi/pulumi-yaml v0.3.0
 	github.com/segmentio/encoding v0.3.5

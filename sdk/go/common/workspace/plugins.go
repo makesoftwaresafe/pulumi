@@ -1009,12 +1009,13 @@ func getPlugins(dir string, skipMetadata bool) ([]PluginInfo, error) {
 	for _, file := range files {
 		// Skip anything that doesn't look like a plugin.
 		if kind, name, version, ok := tryPlugin(file); ok {
+			path := filepath.Join(dir, file.Name())
 			plugin := PluginInfo{
 				Name:    name,
 				Kind:    kind,
 				Version: &version,
+				Path:    path,
 			}
-			path := filepath.Join(dir, file.Name())
 			if _, err := os.Stat(fmt.Sprintf("%s.partial", path)); err == nil {
 				// Skip it if the partial file exists, meaning the plugin is not fully installed.
 				continue
@@ -1038,6 +1039,53 @@ func getPlugins(dir string, skipMetadata bool) ([]PluginInfo, error) {
 // using standard semver sorting rules.  A plugin may be overridden entirely by placing it on your $PATH, though it is
 // possible to opt out of this behavior by setting PULUMI_IGNORE_AMBIENT_PLUGINS to any non-empty value.
 func GetPluginPath(kind PluginKind, name string, version *semver.Version) (string, string, error) {
+	info, path, err := getPluginInfoOrPath(kind, name, version, true /* skipMetadata */)
+	if err != nil {
+		return "", "", err
+	}
+
+	if info != nil {
+		matchDir, err := info.DirPath()
+		if err != nil {
+			return "", "", err
+		}
+
+		matchPath, err := info.FilePath()
+		if err != nil {
+			return "", "", err
+		}
+
+		return matchDir, matchPath, nil
+	}
+
+	return "", path, err
+}
+
+func GetPluginInfo(kind PluginKind, name string, version *semver.Version, skipMetadata bool) (*PluginInfo, error) {
+	info, path, err := getPluginInfoOrPath(kind, name, version, skipMetadata)
+	if err != nil {
+		return nil, err
+	}
+
+	if info != nil {
+		return info, nil
+	}
+
+	info = &PluginInfo{
+		Kind: kind,
+		Name: name,
+		Path: filepath.Dir(path),
+	}
+	if !skipMetadata {
+		if err = info.SetFileMetadata(path); err != nil {
+			return nil, err
+		}
+	}
+
+	return info, nil
+}
+
+func getPluginInfoOrPath(kind PluginKind, name string, version *semver.Version, skipMetadata bool) (*PluginInfo, string, error) {
 	var filename string
 
 	// We currently bundle some plugins with "pulumi" and thus expect them to be next to the pulumi binary. We
@@ -1055,7 +1103,7 @@ func GetPluginPath(kind PluginKind, name string, version *semver.Version) (strin
 		filename = (&PluginInfo{Kind: kind, Name: name, Version: version}).FilePrefix()
 		if path, err := exec.LookPath(filename); err == nil {
 			logging.V(6).Infof("GetPluginPath(%s, %s, %v): found on $PATH %s", kind, name, version, path)
-			return "", path, nil
+			return nil, path, nil
 		}
 	}
 
@@ -1080,7 +1128,7 @@ func GetPluginPath(kind PluginKind, name string, version *semver.Version) (strin
 						logging.V(6).Infof("GetPluginPath(%s, %s, %v): found next to current executable %s",
 							kind, name, version, candidate)
 
-						return "", candidate, nil
+						return nil, candidate, nil
 					}
 				}
 			}
@@ -1088,9 +1136,15 @@ func GetPluginPath(kind PluginKind, name string, version *semver.Version) (strin
 	}
 
 	// Otherwise, check the plugin cache.
-	plugins, err := GetPlugins()
+	var plugins []PluginInfo
+	var err error
+	if skipMetadata {
+		plugins, err = GetPlugins()
+	} else {
+		plugins, err = GetPluginsWithMetadata()
+	}
 	if err != nil {
-		return "", "", errors.Wrapf(err, "loading plugin list")
+		return nil, "", errors.Wrapf(err, "loading plugin list")
 	}
 
 	var match *PluginInfo
@@ -1098,7 +1152,7 @@ func GetPluginPath(kind PluginKind, name string, version *semver.Version) (strin
 		logging.V(6).Infof("GetPluginPath(%s, %s, %s): enabling new plugin behavior", kind, name, version)
 		candidate, err := SelectCompatiblePlugin(plugins, kind, name, semver.MustParseRange(version.String()))
 		if err != nil {
-			return "", "", NewMissingError(PluginInfo{
+			return nil, "", NewMissingError(PluginInfo{
 				Name:    name,
 				Kind:    kind,
 				Version: version,
@@ -1133,20 +1187,16 @@ func GetPluginPath(kind PluginKind, name string, version *semver.Version) (strin
 	}
 
 	if match != nil {
-		matchDir, err := match.DirPath()
-		if err != nil {
-			return "", "", err
-		}
 		matchPath, err := match.FilePath()
 		if err != nil {
-			return "", "", err
+			return nil, "", err
 		}
 
 		logging.V(6).Infof("GetPluginPath(%s, %s, %v): found in cache at %s", kind, name, version, matchPath)
-		return matchDir, matchPath, nil
+		return match, matchPath, nil
 	}
 
-	return "", "", NewMissingError(PluginInfo{
+	return nil, "", NewMissingError(PluginInfo{
 		Name:    name,
 		Kind:    kind,
 		Version: version,
