@@ -591,8 +591,10 @@ func (info *PluginInfo) SetFileMetadata(path string) error {
 	// Next get the access times from the plugin binary itself.
 	tinfo := times.Get(file)
 
-	if tinfo.HasBirthTime() {
-		info.InstallTime = tinfo.BirthTime()
+	if tinfo.HasChangeTime() {
+		info.InstallTime = tinfo.ChangeTime()
+	} else {
+		info.InstallTime = tinfo.ModTime()
 	}
 
 	info.LastUsedTime = tinfo.AccessTime()
