@@ -1087,7 +1087,8 @@ func GetPluginInfo(kind PluginKind, name string, version *semver.Version, skipMe
 	return info, nil
 }
 
-func getPluginInfoOrPath(kind PluginKind, name string, version *semver.Version, skipMetadata bool) (*PluginInfo, string, error) {
+func getPluginInfoOrPath(
+	kind PluginKind, name string, version *semver.Version, skipMetadata bool) (*PluginInfo, string, error) {
 	var filename string
 
 	// We currently bundle some plugins with "pulumi" and thus expect them to be next to the pulumi binary. We
