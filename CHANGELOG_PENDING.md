@@ -9,6 +9,9 @@
 - [sdk/nodejs] Lazy load inflight context to remove module import side-effect.
   [#9375](https://github.com/pulumi/pulumi/issues/9375)
 
+- [engine] Reduce memory usage via caching
+  [#9684](https://github.com/pulumi/pulumi/issues/9684)
+
 ### Bug Fixes
 
 - [sdk/python] Fix spurious diffs causing an "update" on resources created by dynamic providers.
