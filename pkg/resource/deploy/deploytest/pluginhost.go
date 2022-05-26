@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/blang/semver"
 	pbempty "github.com/golang/protobuf/ptypes/empty"
@@ -57,12 +58,19 @@ func WithGrpc(p *PluginLoader) {
 	p.useGRPC = true
 }
 
+func WithPath(path string) func(p *PluginLoader) {
+	return func(p *PluginLoader) {
+		p.path = path
+	}
+}
+
 type PluginLoader struct {
 	kind         workspace.PluginKind
 	name         string
 	version      semver.Version
 	load         LoadPluginFunc
 	loadWithHost LoadPluginWithHostFunc
+	path         string
 	useGRPC      bool
 }
 
@@ -390,6 +398,24 @@ func (host *pluginHost) ListPlugins() []workspace.PluginInfo {
 }
 func (host *pluginHost) EnsurePlugins(plugins []workspace.PluginInfo, kinds plugin.Flags) error {
 	return nil
+}
+func (host *pluginHost) ResolvePlugin(
+	kind workspace.PluginKind, name string, version *semver.Version, skipMetadata bool) (*workspace.PluginInfo, error) {
+	for _, v := range host.pluginLoaders {
+		if v.kind == kind && v.name == name {
+			// TODO: for multi-version testing, support multiple versions of plugins concurrently. Not
+			// allowed at present time.
+			return &workspace.PluginInfo{
+				Kind:        kind,
+				Name:        name,
+				Path:        v.path,
+				Version:     &v.version,
+				InstallTime: time.Unix(1, 0), // Non-zero to enable caching.
+			}, nil
+		}
+	}
+
+	return nil, nil
 }
 func (host *pluginHost) GetRequiredPlugins(info plugin.ProgInfo,
 	kinds plugin.Flags) ([]workspace.PluginInfo, error) {

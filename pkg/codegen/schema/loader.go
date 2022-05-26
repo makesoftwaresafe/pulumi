@@ -249,7 +249,11 @@ func LoadPackageReference(loader Loader, pkg string, version *semver.Version) (P
 }
 
 func (l *pluginLoader) loadSchemaBytes(pkg string, version *semver.Version) ([]byte, *semver.Version, error) {
-	pluginInfo, err := workspace.GetPluginInfo(workspace.ResourcePlugin, pkg, nil, false /* skipMetadata */)
+	if err := l.ensurePlugin(pkg, version); err != nil {
+		return nil, nil, err
+	}
+
+	pluginInfo, err := l.host.ResolvePlugin(workspace.ResourcePlugin, pkg, nil, false /* skipMetadata */)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -258,7 +262,7 @@ func (l *pluginLoader) loadSchemaBytes(pkg string, version *semver.Version) ([]b
 		version = pluginInfo.Version
 	}
 
-	cachedSchemaPath := filepath.Join(pluginInfo.Path, fmt.Sprintf("schema-%v.json", pkg))
+	cachedSchemaPath := filepath.Join(pluginInfo.Path, pkg+".json")
 
 	schemaBytes, ok := l.loadCachedSchemaBytes(pkg, cachedSchemaPath, pluginInfo.InstallTime)
 	if ok {
@@ -288,10 +292,6 @@ func (l *pluginLoader) loadSchemaBytes(pkg string, version *semver.Version) ([]b
 }
 
 func (l *pluginLoader) loadPluginSchemaBytes(pkg string, version *semver.Version) ([]byte, plugin.Provider, error) {
-	if err := l.ensurePlugin(pkg, version); err != nil {
-		return nil, nil, err
-	}
-
 	provider, err := l.host.Provider(tokens.Package(pkg), version)
 	if err != nil {
 		return nil, nil, err
