@@ -484,6 +484,7 @@ type PluginInfo struct {
 	LastUsedTime      time.Time       // the last time the plugin was used.
 	PluginDownloadURL string          // an optional server to use when downloading this plugin.
 	PluginDir         string          // if set, will be used as the root plugin dir instead of ~/.pulumi/plugins.
+	SchemaName        string          // if set, will be used as a substitute name for the schema file to load
 }
 
 // Dir gets the expected plugin directory for this plugin.

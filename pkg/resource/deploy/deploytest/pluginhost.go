@@ -410,6 +410,7 @@ func (host *pluginHost) ResolvePlugin(
 				Name:        name,
 				Path:        v.path,
 				Version:     &v.version,
+				SchemaName:  name + ".json",
 				InstallTime: time.Unix(1, 0), // Non-zero to enable caching.
 			}, nil
 		}

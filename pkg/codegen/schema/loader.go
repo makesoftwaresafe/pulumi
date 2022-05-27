@@ -262,7 +262,11 @@ func (l *pluginLoader) loadSchemaBytes(pkg string, version *semver.Version) ([]b
 		version = pluginInfo.Version
 	}
 
-	cachedSchemaPath := filepath.Join(pluginInfo.Path, pkg+".json")
+	schemaName := pluginInfo.SchemaName
+	if schemaName == "" {
+		schemaName = "schema-" + pkg + ".json"
+	}
+	cachedSchemaPath := filepath.Join(pluginInfo.Path, schemaName)
 
 	schemaBytes, ok := l.loadCachedSchemaBytes(pkg, cachedSchemaPath, pluginInfo.InstallTime)
 	if ok {
