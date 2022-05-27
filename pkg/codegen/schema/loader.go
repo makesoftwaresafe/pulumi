@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/edsrzf/mmap-go"
+	"github.com/hashicorp/go-multierror"
 
 	"github.com/blang/semver"
 	"github.com/segmentio/encoding/json"
@@ -180,23 +181,24 @@ func (l *pluginLoader) ensurePlugin(pkg string, version *semver.Version) error {
 }
 
 func (l *pluginLoader) Close() error {
+	var result error
 	for _, m := range l.mmaps {
 		if err := m.Unmap(); err != nil {
-			return err
+			result = multierror.Append(result, err)
 		}
 	}
 
 	for _, f := range l.files {
 		if err := f.Close(); err != nil {
-			return err
+			result = multierror.Append(result, err)
 		}
 	}
 
 	if err := l.host.Close(); err != nil {
-		return err
+		result = multierror.Append(result, err)
 	}
 
-	return nil
+	return result
 }
 
 func (l *pluginLoader) LoadPackage(pkg string, version *semver.Version) (*Package, error) {
