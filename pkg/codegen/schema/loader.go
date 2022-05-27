@@ -39,11 +39,11 @@ type pluginLoader struct {
 	files   []*os.File
 	mmaps   []mmap.MMap
 
-	cacheOptions PluginLoaderCacheOptions
+	cacheOptions pluginLoaderCacheOptions
 }
 
 // Caching options intended for benchmarking or debugging:
-type PluginLoaderCacheOptions struct {
+type pluginLoaderCacheOptions struct {
 	// useEntriesCache enables in-memory re-use of packages
 	disableEntryCache bool
 	// useFileCache enables skipping plugin loading when possible and caching JSON schemas to files.
@@ -59,7 +59,7 @@ func NewPluginLoader(host plugin.Host) ReferenceLoader {
 	}
 }
 
-func NewPluginLoaderWithOptions(host plugin.Host, cacheOptions PluginLoaderCacheOptions) ReferenceLoader {
+func newPluginLoaderWithOptions(host plugin.Host, cacheOptions pluginLoaderCacheOptions) ReferenceLoader {
 	return &pluginLoader{
 		host:    host,
 		entries: map[string]PackageReference{},
