@@ -18,35 +18,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 
+	"github.com/pulumi/pulumi/sdk/v3/go/common/encoding"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
-
-// projectSingleton is a singleton instance of projectLoader, which controls a global map of instances of Project
-// configs (one per path).
-var projectSingleton = &projectLoader{
-	internal: map[string]*Project{},
-}
-
-// projectStackSingleton is a singleton instance of projectStackLoader, which controls a global map of instances of
-// ProjectStack configs (one per path).
-var projectStackSingleton = &projectStackLoader{
-	internal: map[string]*ProjectStack{},
-}
-
-// pluginProjectSingleton is a singleton instance of pluginProjectLoader, which controls a global map of instances of
-// PluginProject configs (one per path).
-var pluginProjectSingleton = &pluginProjectLoader{
-	internal: map[string]*PluginProject{},
-}
-
-// policyPackProjectSingleton is a singleton instance of policyPackProjectLoader, which controls a global map of
-// instances of PolicyPackProject configs (one per path).
-var policyPackProjectSingleton = &policyPackProjectLoader{
-	internal: map[string]*PolicyPackProject{},
-}
 
 // readFileStripUTF8BOM wraps os.ReadFile and also strips the UTF-8 Byte-order Mark (BOM) if present.
 func readFileStripUTF8BOM(path string) ([]byte, error) {
@@ -67,78 +43,6 @@ func readFileStripUTF8BOM(path string) ([]byte, error) {
 	}
 
 	return b, nil
-}
-
-// projectLoader is used to load a single global instance of a Project config.
-type projectLoader struct {
-	sync.RWMutex
-	internal map[string]*Project
-}
-
-// Load a Project config file from the specified path. The configuration will be cached for subsequent loads.
-func (singleton *projectLoader) load(path string) (*Project, error) {
-	singleton.Lock()
-	defer singleton.Unlock()
-
-	if v, ok := singleton.internal[path]; ok {
-		return v, nil
-	}
-
-	marshaller, err := marshallerForPath(path)
-	if err != nil {
-		return nil, fmt.Errorf("can not read '%s': %w", path, err)
-	}
-
-	b, err := readFileStripUTF8BOM(path)
-	if err != nil {
-		return nil, fmt.Errorf("could not read '%s': %w", path, err)
-	}
-
-	var raw interface{}
-	err = marshaller.Unmarshal(b, &raw)
-	if err != nil {
-		return nil, fmt.Errorf("could not unmarshal '%s': %w", path, err)
-	}
-
-	err = ValidateProject(raw)
-	if err != nil {
-		return nil, fmt.Errorf("could not validate '%s': %w", path, err)
-	}
-
-	// just before marshalling, we will rewrite the config values
-	projectDef, err := SimplifyMarshalledProject(raw)
-	if err != nil {
-		return nil, err
-	}
-
-	projectDef, rewriteError := RewriteConfigPathIntoStackConfigDir(projectDef)
-	if rewriteError != nil {
-		return nil, rewriteError
-	}
-
-	projectDef = RewriteShorthandConfigValues(projectDef)
-	modifiedProject, _ := marshaller.Marshal(projectDef)
-
-	var project Project
-	err = marshaller.Unmarshal(modifiedProject, &project)
-	if err != nil {
-		return nil, err
-	}
-
-	err = project.Validate()
-	if err != nil {
-		return nil, fmt.Errorf("could not unmarshal '%s': %w", path, err)
-	}
-
-	project.raw = b
-	singleton.internal[path] = &project
-	return &project, nil
-}
-
-// projectStackLoader is used to load a single global instance of a ProjectStack config.
-type projectStackLoader struct {
-	sync.RWMutex
-	internal map[string]*ProjectStack
 }
 
 // Rewrite config values to make them namespaced. Using the project name as the default namespace
@@ -181,14 +85,68 @@ func stackConfigNamespacedWithProject(project *Project, projectStack map[string]
 	return projectStack
 }
 
-// Load a ProjectStack config file from the specified path. The configuration will be cached for subsequent loads.
-func (singleton *projectStackLoader) load(project *Project, path string) (*ProjectStack, error) {
-	singleton.Lock()
-	defer singleton.Unlock()
+// LoadProject reads a project definition from a file.
+func LoadProject(path string) (*Project, error) {
+	contract.Requiref(path != "", "path", "must not be empty")
 
-	if v, ok := singleton.internal[path]; ok {
-		return v, nil
+	marshaller, err := marshallerForPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("can not read '%s': %w", path, err)
 	}
+
+	b, err := readFileStripUTF8BOM(path)
+	if err != nil {
+		return nil, fmt.Errorf("could not read '%s': %w", path, err)
+	}
+
+	return LoadProjectBytes(b, path, marshaller)
+}
+
+// LoadProjectBytes reads a project definition from a byte slice.
+func LoadProjectBytes(b []byte, path string, marshaller encoding.Marshaler) (*Project, error) {
+	var raw interface{}
+	err := marshaller.Unmarshal(b, &raw)
+	if err != nil {
+		return nil, fmt.Errorf("could not unmarshal '%s': %w", path, err)
+	}
+
+	err = ValidateProject(raw)
+	if err != nil {
+		return nil, fmt.Errorf("could not validate '%s': %w", path, err)
+	}
+
+	// just before marshalling, we will rewrite the config values
+	projectDef, err := SimplifyMarshalledProject(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	projectDef, rewriteError := RewriteConfigPathIntoStackConfigDir(projectDef)
+	if rewriteError != nil {
+		return nil, rewriteError
+	}
+
+	projectDef = RewriteShorthandConfigValues(projectDef)
+	modifiedProject, _ := marshaller.Marshal(projectDef)
+
+	var project Project
+	err = marshaller.Unmarshal(modifiedProject, &project)
+	if err != nil {
+		return nil, err
+	}
+
+	err = project.Validate()
+	if err != nil {
+		return nil, fmt.Errorf("could not unmarshal '%s': %w", path, err)
+	}
+
+	project.raw = b
+	return &project, nil
+}
+
+// LoadProjectStack reads a stack definition from a file.
+func LoadProjectStack(project *Project, path string) (*ProjectStack, error) {
+	contract.Requiref(path != "", "path", "must not be empty")
 
 	marshaller, err := marshallerForPath(path)
 	if err != nil {
@@ -200,14 +158,41 @@ func (singleton *projectStackLoader) load(project *Project, path string) (*Proje
 		defaultProjectStack := ProjectStack{
 			Config: make(config.Map),
 		}
-		singleton.internal[path] = &defaultProjectStack
 		return &defaultProjectStack, nil
 	} else if err != nil {
 		return nil, err
 	}
 
+	return LoadProjectStackBytes(project, b, path, marshaller)
+}
+
+func LoadProjectStackDeployment(path string) (*ProjectStackDeployment, error) {
+	contract.Requiref(path != "", "path", "must not be empty")
+
+	marshaller, err := marshallerForPath(path)
+	if err != nil {
+		return nil, err
+	}
+
+	b, err := readFileStripUTF8BOM(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	return LoadProjectStackDeploymentBytes(b, path, marshaller)
+}
+
+// LoadProjectStack reads a stack definition from a byte slice.
+func LoadProjectStackBytes(
+	project *Project,
+	b []byte,
+	path string,
+	marshaller encoding.Marshaler,
+) (*ProjectStack, error) {
 	var projectStackRaw interface{}
-	err = marshaller.Unmarshal(b, &projectStackRaw)
+	err := marshaller.Unmarshal(b, &projectStackRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +202,6 @@ func (singleton *projectStackLoader) load(project *Project, path string) (*Proje
 		defaultProjectStack := ProjectStack{
 			Config: make(config.Map),
 		}
-		singleton.internal[path] = &defaultProjectStack
 		return &defaultProjectStack, nil
 	}
 
@@ -249,24 +233,26 @@ func (singleton *projectStackLoader) load(project *Project, path string) (*Proje
 	}
 
 	projectStack.raw = b
-	singleton.internal[path] = &projectStack
 	return &projectStack, nil
 }
 
-// pluginProjectLoader is used to load a single global instance of a PluginProject config.
-type pluginProjectLoader struct {
-	sync.RWMutex
-	internal map[string]*PluginProject
+func LoadProjectStackDeploymentBytes(
+	b []byte,
+	path string,
+	marshaller encoding.Marshaler,
+) (*ProjectStackDeployment, error) {
+	var projectStackDeployment ProjectStackDeployment
+	err := marshaller.Unmarshal(b, &projectStackDeployment)
+	if err != nil {
+		return nil, err
+	}
+
+	return &projectStackDeployment, nil
 }
 
-// Load a PluginProject config file from the specified path. The configuration will be cached for subsequent loads.
-func (singleton *pluginProjectLoader) load(path string) (*PluginProject, error) {
-	singleton.Lock()
-	defer singleton.Unlock()
-
-	if result, ok := singleton.internal[path]; ok {
-		return result, nil
-	}
+// LoadPluginProject reads a plugin project definition from a file.
+func LoadPluginProject(path string) (*PluginProject, error) {
+	contract.Requiref(path != "", "path", "must not be empty")
 
 	marshaller, err := marshallerForPath(path)
 	if err != nil {
@@ -289,24 +275,12 @@ func (singleton *pluginProjectLoader) load(path string) (*PluginProject, error) 
 		return nil, err
 	}
 
-	singleton.internal[path] = &pluginProject
 	return &pluginProject, nil
 }
 
-// policyPackProjectLoader is used to load a single global instance of a PolicyPackProject config.
-type policyPackProjectLoader struct {
-	sync.RWMutex
-	internal map[string]*PolicyPackProject
-}
-
-// Load a PolicyPackProject config file from the specified path. The configuration will be cached for subsequent loads.
-func (singleton *policyPackProjectLoader) load(path string) (*PolicyPackProject, error) {
-	singleton.Lock()
-	defer singleton.Unlock()
-
-	if result, ok := singleton.internal[path]; ok {
-		return result, nil
-	}
+// LoadPolicyPack reads a policy pack definition from a file.
+func LoadPolicyPack(path string) (*PolicyPackProject, error) {
+	contract.Requiref(path != "", "path", "must not be empty")
 
 	marshaller, err := marshallerForPath(path)
 	if err != nil {
@@ -329,34 +303,5 @@ func (singleton *policyPackProjectLoader) load(path string) (*PolicyPackProject,
 		return nil, err
 	}
 
-	singleton.internal[path] = &policyPackProject
 	return &policyPackProject, nil
-}
-
-// LoadProject reads a project definition from a file.
-func LoadProject(path string) (*Project, error) {
-	contract.Require(path != "", "path")
-
-	return projectSingleton.load(path)
-}
-
-// LoadProjectStack reads a stack definition from a file.
-func LoadProjectStack(project *Project, path string) (*ProjectStack, error) {
-	contract.Require(path != "", "path")
-
-	return projectStackSingleton.load(project, path)
-}
-
-// LoadPluginProject reads a plugin project definition from a file.
-func LoadPluginProject(path string) (*PluginProject, error) {
-	contract.Require(path != "", "path")
-
-	return pluginProjectSingleton.load(path)
-}
-
-// LoadPolicyPack reads a policy pack definition from a file.
-func LoadPolicyPack(path string) (*PolicyPackProject, error) {
-	contract.Require(path != "", "path")
-
-	return policyPackProjectSingleton.load(path)
 }

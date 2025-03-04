@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 	"github.com/go-git/go-git/v5/plumbing/transport"
@@ -29,14 +31,20 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport/ssh"
 )
 
+var transportMutex sync.Mutex
+
 func setupGitRepo(ctx context.Context, workDir string, repoArgs *GitRepo) (string, error) {
 	cloneOptions := &git.CloneOptions{
 		RemoteName: "origin", // be explicit so we can require it in remote refs
 		URL:        repoArgs.URL,
 	}
 
-	if repoArgs.Auth != nil {
+	if repoArgs.Shallow {
+		cloneOptions.Depth = 1
+		cloneOptions.SingleBranch = true
+	}
 
+	if repoArgs.Auth != nil {
 		authDetails := repoArgs.Auth
 		// Each of the authentication options are mutually exclusive so let's check that only 1 is specified
 		if authDetails.SSHPrivateKeyPath != "" && authDetails.Username != "" ||
@@ -113,27 +121,53 @@ func setupGitRepo(ctx context.Context, workDir string, repoArgs *GitRepo) (strin
 		cloneOptions.ReferenceName = refName
 	}
 
-	// Azure DevOps requires multi_ack and multi_ack_detailed capabilities, which go-git doesn't
-	// implement. But: it's possible to do a full clone by saying it's _not_ _un_supported, in which
-	// case the library happily functions so long as it doesn't _actually_ get a multi_ack packet. See
+	// Azure DevOps requires multi_ack and multi_ack_detailed capabilities, which go-git doesn't implement.
+	// But: it's possible to do a full clone by saying it's _not_ _un_supported, in which case the library
+	// happily functions so long as it doesn't _actually_ get a multi_ack packet. See
 	// https://github.com/go-git/go-git/blob/v5.5.1/_examples/azure_devops/main.go.
-	oldUnsupportedCaps := transport.UnsupportedCapabilities
-	// This check is crude, but avoids having another dependency to parse the git URL.
-	if strings.Contains(repoArgs.URL, "dev.azure.com") {
-		transport.UnsupportedCapabilities = []capability.Capability{
-			capability.ThinPack,
-		}
-	}
+	repo, err := func() (*git.Repository, error) {
+		// Because transport.UnsupportedCapabilities is a global variable, we need a global lock around the
+		// use of this.
+		transportMutex.Lock()
+		defer transportMutex.Unlock()
 
-	// clone
-	repo, err := git.PlainCloneContext(ctx, workDir, false, cloneOptions)
+		oldUnsupportedCaps := transport.UnsupportedCapabilities
+		// This check is crude, but avoids having another dependency to parse the git URL.
+		if strings.Contains(repoArgs.URL, "dev.azure.com") {
+			transport.UnsupportedCapabilities = []capability.Capability{
+				capability.ThinPack,
+			}
+		}
+
+		// clone
+		repo, err := git.PlainCloneContext(ctx, workDir, false, cloneOptions)
+
+		// Regardless of error we need to restore the UnsupportedCapabilities
+		transport.UnsupportedCapabilities = oldUnsupportedCaps
+		return repo, err
+	}()
 	if err != nil {
 		return "", fmt.Errorf("unable to clone repo: %w", err)
 	}
 
-	transport.UnsupportedCapabilities = oldUnsupportedCaps
-
 	if repoArgs.CommitHash != "" {
+		// ensure that the commit has been fetched
+		err := func() error {
+			// repo.FetchContext ends up looking at the global transport.UnsupportedCapabilities, so we need a
+			// global lock around the use of this.
+			transportMutex.Lock()
+			defer transportMutex.Unlock()
+			return repo.FetchContext(ctx, &git.FetchOptions{
+				RemoteName: "origin",
+				Auth:       cloneOptions.Auth,
+				Depth:      cloneOptions.Depth,
+				RefSpecs:   []config.RefSpec{config.RefSpec(repoArgs.CommitHash + ":" + repoArgs.CommitHash)},
+			})
+		}()
+		if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) && !errors.Is(err, git.ErrExactSHA1NotSupported) {
+			return "", fmt.Errorf("fetching commit: %w", err)
+		}
+
 		// checkout commit if specified
 		w, err := repo.Worktree()
 		if err != nil {

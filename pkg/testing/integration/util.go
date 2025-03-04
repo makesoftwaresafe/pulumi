@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2024, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,9 +17,11 @@ package integration
 import (
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path"
 	"path/filepath"
 	"strings"
@@ -27,6 +29,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
@@ -59,8 +63,8 @@ func ReplaceInFile(old, new, path string) error {
 	if err != nil {
 		return err
 	}
-	newContents := strings.Replace(string(rawContents), old, new, -1)
-	return os.WriteFile(path, []byte(newContents), os.ModePerm)
+	newContents := strings.ReplaceAll(string(rawContents), old, new)
+	return os.WriteFile(path, []byte(newContents), 0o600)
 }
 
 // getCmdBin returns the binary named bin in location loc or, if it hasn't yet been initialized, will lazily
@@ -83,7 +87,7 @@ func uniqueSuffix() string {
 	// .<timestamp>.<five random hex characters>
 	timestamp := time.Now().Format("20060102-150405")
 	suffix, err := resource.NewUniqueHex("."+timestamp+".", 5, -1)
-	contract.AssertNoError(err)
+	contract.AssertNoErrorf(err, "could not generate random suffix")
 	return suffix
 }
 
@@ -93,13 +97,13 @@ const (
 
 func writeCommandOutput(commandName, runDir string, output []byte) (string, error) {
 	logFileDir := filepath.Join(runDir, commandOutputFolderName)
-	if err := os.MkdirAll(logFileDir, 0700); err != nil {
+	if err := os.MkdirAll(logFileDir, 0o700); err != nil {
 		return "", fmt.Errorf("Failed to create '%s': %w", logFileDir, err)
 	}
 
 	logFile := filepath.Join(logFileDir, commandName+uniqueSuffix()+".log")
 
-	if err := os.WriteFile(logFile, output, 0600); err != nil {
+	if err := os.WriteFile(logFile, output, 0o600); err != nil {
 		return "", fmt.Errorf("Failed to write '%s': %w", logFile, err)
 	}
 
@@ -186,7 +190,7 @@ func AssertHTTPResultWithRetry(
 		return false
 	}
 	if !(strings.HasPrefix(hostname, "http://") || strings.HasPrefix(hostname, "https://")) {
-		hostname = fmt.Sprintf("http://%s", hostname)
+		hostname = "http://" + hostname
 	}
 	var err error
 	var resp *http.Response
@@ -241,4 +245,47 @@ func AssertHTTPResultWithRetry(
 	}
 	// Verify it matches expectations
 	return check(string(body))
+}
+
+func CheckRuntimeOptions(t *testing.T, root string, expected map[string]interface{}) {
+	t.Helper()
+
+	var config struct {
+		Runtime struct {
+			Name    string                 `yaml:"name"`
+			Options map[string]interface{} `yaml:"options"`
+		} `yaml:"runtime"`
+	}
+	yamlFile, err := os.ReadFile(filepath.Join(root, "Pulumi.yaml"))
+	if err != nil {
+		t.Logf("could not read Pulumi.yaml in %s", root)
+		t.FailNow()
+	}
+	if err := yaml.Unmarshal(yamlFile, &config); err != nil {
+		t.Logf("could not parse Pulumi.yaml in %s", root)
+		t.FailNow()
+	}
+
+	require.Equal(t, expected, config.Runtime.Options)
+}
+
+func createTemporaryGoFolder(prefix string) (string, error) {
+	gopath := os.Getenv("GOPATH")
+	if gopath == "" {
+		usr, userErr := user.Current()
+		if userErr != nil {
+			return "", userErr
+		}
+		gopath = filepath.Join(usr.HomeDir, "go")
+	}
+
+	folder := fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), rand.Intn(1000000)) //nolint:gosec
+
+	testRoot := filepath.Join(gopath, "src", folder)
+	err := os.MkdirAll(testRoot, 0o700)
+	if err != nil {
+		return "", err
+	}
+
+	return testRoot, err
 }

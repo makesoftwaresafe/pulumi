@@ -43,7 +43,7 @@ func (d DocLanguageHelper) GetDocLinkForPulumiType(pkg *schema.Package, typeName
 	version := pulumiSDKVersion
 	if info, ok := pkg.Language["go"].(GoPackageInfo); ok {
 		if info.PulumiSDKVersion == 1 {
-			return fmt.Sprintf("https://pkg.go.dev/github.com/pulumi/pulumi/sdk/go/pulumi?tab=doc#%s", typeName)
+			return "https://pkg.go.dev/github.com/pulumi/pulumi/sdk/go/pulumi?tab=doc#" + typeName
 		}
 		if info.PulumiSDKVersion != 0 {
 			version = fmt.Sprintf("v%d", info.PulumiSDKVersion)
@@ -101,7 +101,7 @@ func (d DocLanguageHelper) GetLanguageTypeString(pkg *schema.Package, moduleName
 func (d *DocLanguageHelper) GeneratePackagesMap(pkg *schema.Package, tool string, goInfo GoPackageInfo) {
 	var err error
 	d.packages, err = generatePackageContextMap(tool, pkg.Reference(), goInfo, nil)
-	contract.AssertNoError(err)
+	contract.AssertNoErrorf(err, "Could not generate package context map for %q", pkg.Name)
 }
 
 // GetPropertyName returns the property name specific to Go.
@@ -143,8 +143,8 @@ func (d DocLanguageHelper) GetMethodName(m *schema.Method) string {
 }
 
 func (d DocLanguageHelper) GetMethodResultName(pkg *schema.Package, modName string, r *schema.Resource,
-	m *schema.Method) string {
-
+	m *schema.Method,
+) string {
 	if info, ok := pkg.Language["go"].(GoPackageInfo); ok {
 		var objectReturnType *schema.ObjectType
 		if m.Function.ReturnType != nil {

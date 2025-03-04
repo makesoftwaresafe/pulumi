@@ -1,0 +1,6 @@
+name: l2-large-string
+runtime:
+  name: python
+  options:
+    typechecker: pyright
+    virtualenv: venv

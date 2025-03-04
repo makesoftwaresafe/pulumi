@@ -26,11 +26,11 @@ import (
 	"time"
 
 	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/pulumi/appdash"
+	appdash_opentracing "github.com/pulumi/appdash/opentracing"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	jaeger "github.com/uber/jaeger-client-go"
 	"github.com/uber/jaeger-client-go/transport/zipkin"
-	"sourcegraph.com/sourcegraph/appdash"
-	appdash_opentracing "sourcegraph.com/sourcegraph/appdash/opentracing"
 )
 
 // TracingEndpoint is the Zipkin-compatible tracing endpoint where tracing data will be sent.
@@ -67,7 +67,6 @@ func IsTracingEnabled() bool {
 
 // InitTracing initializes tracing
 func InitTracing(name, rootSpanName, tracingEndpoint string) {
-
 	// If no tracing endpoint was provided, just return. The default global tracer is already a no-op tracer.
 	if tracingEndpoint == "" {
 		return
@@ -202,7 +201,6 @@ func startProxyAppDashServer(collector appdash.Collector) (string, error) {
 // Computes initial tags to write to the `TracingRootSpan`, which can
 // be useful for aggregating trace data in benchmarks.
 func rootSpanTags() []opentracing.Tag {
-
 	tags := []opentracing.Tag{
 		{
 			Key:   "os.Args",

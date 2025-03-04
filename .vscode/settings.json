@@ -11,8 +11,8 @@
             "-sdk/nodejs/tests",
             "-sdk/python/env"
         ],
-        // Experimental but seems to work and means we don't need a vscode instance per go.mod file.
-        "experimentalWorkspaceModule": true,
+        // Uses https://github.com/mvdan/gofumpt for formatting.
+        "formatting.gofumpt": true,
     },
 
     "python.testing.pytestArgs": [

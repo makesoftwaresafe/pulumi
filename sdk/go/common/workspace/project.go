@@ -23,15 +23,27 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/pulumi/esc/ast"
+	"github.com/pulumi/esc/eval"
+	"github.com/texttheater/golang-levenshtein/levenshtein"
+
 	"github.com/hashicorp/go-multierror"
+	"github.com/pgavlin/fx"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/encoding"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	"github.com/santhosh-tekuri/jsonschema/v5"
+	"golang.org/x/exp/maps"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -62,14 +74,20 @@ type Analyzers []tokens.QName
 
 // ProjectTemplate is a Pulumi project template manifest.
 type ProjectTemplate struct {
+	// DisplayName is an optional user friendly name of the template.
+	DisplayName string `json:"displayName,omitempty" yaml:"displayName,omitempty"`
 	// Description is an optional description of the template.
 	Description string `json:"description,omitempty" yaml:"description,omitempty"`
 	// Quickstart contains optional text to be displayed after template creation.
 	Quickstart string `json:"quickstart,omitempty" yaml:"quickstart,omitempty"`
 	// Config is an optional template config.
 	Config map[string]ProjectTemplateConfigValue `json:"config,omitempty" yaml:"config,omitempty"`
-	// Important indicates the template is important and should be listed by default.
+	// Important indicates the template is important.
+	//
+	// Deprecated: We don't use this field any more.
 	Important bool `json:"important,omitempty" yaml:"important,omitempty"`
+	// Metadata are key/value pairs used to attach additional metadata to a template.
+	Metadata map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 }
 
 // ProjectTemplateConfigValue is a config value included in the project template manifest.
@@ -82,7 +100,13 @@ type ProjectTemplateConfigValue struct {
 	Secret bool `json:"secret,omitempty" yaml:"secret,omitempty"`
 }
 
-// ProjectBackend is a configuration for backend used by project
+// ProjectBackend is the configuration for where the backend state is stored. If unset, will use the
+// system's currently logged-in backend.
+//
+// Use the same URL format that is passed to "pulumi login", see
+// https://www.pulumi.com/docs/cli/commands/pulumi_login/
+//
+// To explicitly use the Pulumi Cloud backend, use URL "https://api.pulumi.com"
 type ProjectBackend struct {
 	// URL is optional field to explicitly set backend url
 	URL string `json:"url,omitempty" yaml:"url,omitempty"`
@@ -258,7 +282,6 @@ func RewriteShorthandConfigValues(project map[string]interface{}) map[string]int
 	}
 
 	for key, value := range config {
-
 		if isPrimitiveValue(value) || isArray(value) {
 			configTypeDefinition := make(map[string]interface{})
 			if configKeyIsNamespacedByProject(projectName, key) {
@@ -328,25 +351,43 @@ func SimplifyMarshalledProject(raw interface{}) (map[string]interface{}, error) 
 }
 
 func ValidateProject(raw interface{}) error {
-
 	project, err := SimplifyMarshalledProject(raw)
 	if err != nil {
 		return err
 	}
 
-	// Couple of manual errors to match Validate
+	// Manually validate keys that need more validation than the raw JSON schema
+	// can provide.
 	name, ok := project["name"]
 	if !ok {
+		closest := findClosestKey("name", project, maxValidationAttributeDistance)
+		if closest != "" {
+			return fmt.Errorf(
+				"project is missing a 'name' attribute; found '%s' instead",
+				closest,
+			)
+		}
+
 		return errors.New("project is missing a 'name' attribute")
 	}
+
 	if strName, ok := name.(string); !ok || strName == "" {
 		return errors.New("project is missing a non-empty string 'name' attribute")
 	}
+
 	if _, ok := project["runtime"]; !ok {
+		closest := findClosestKey("runtime", project, maxValidationAttributeDistance)
+		if closest != "" {
+			return fmt.Errorf(
+				"project is missing a 'runtime' attribute; found '%s' instead",
+				closest,
+			)
+		}
 		return errors.New("project is missing a 'runtime' attribute")
 	}
 
-	// Let everything else be caught by jsonschema
+	// We'll catch everything else with JSON schema, though we'll still try to
+	// suggest fixes for common mistakes.
 	if err = ProjectSchema.Validate(project); err == nil {
 		return nil
 	}
@@ -355,16 +396,41 @@ func ValidateProject(raw interface{}) error {
 		return err
 	}
 
+	notAllowedRe := regexp.MustCompile(`'(\w[a-zA-Z0-9_]*)' not allowed$`)
+
 	var errs *multierror.Error
 	var appendError func(err *jsonschema.ValidationError)
 	appendError = func(err *jsonschema.ValidationError) {
 		if err.InstanceLocation != "" && err.Message != "" {
 			errorf := func(path, message string, args ...interface{}) error {
-				contract.Require(path != "", "path")
+				contract.Requiref(path != "", "path", "path must not be empty")
 				return fmt.Errorf("%s: %s", path, fmt.Sprintf(message, args...))
 			}
 
-			errs = multierror.Append(errs, errorf("#"+err.InstanceLocation, "%v", err.Message))
+			msg := err.Message
+
+			if match := notAllowedRe.FindStringSubmatch(msg); match != nil {
+				attrName := match[1]
+				attributes := getSchemaPathAttributes(err.InstanceLocation)
+
+				closest := findClosestKey(attrName, attributes, maxValidationAttributeDistance)
+				if closest != "" {
+					msg = fmt.Sprintf("%s; did you mean '%s'?", msg, closest)
+				} else if len(attributes) > 0 {
+					valid := make([]string, 0, len(attributes))
+					for k := range attributes {
+						valid = append(valid, "'"+k+"'")
+					}
+					if len(valid) > 1 {
+						sort.StringSlice.Sort(valid)
+						msg = fmt.Sprintf("%s; the allowed attributes are %v and %s",
+							msg, strings.Join(valid[:len(valid)-1], ", "), valid[len(valid)-1])
+					} else {
+						msg = fmt.Sprintf("%s; the only allowed attribute is %s", msg, valid[0])
+					}
+				}
+			}
+			errs = multierror.Append(errs, errorf("#"+err.InstanceLocation, "%v", msg))
 		}
 		for _, err := range err.Causes {
 			appendError(err)
@@ -373,6 +439,120 @@ func ValidateProject(raw interface{}) error {
 	appendError(validationError)
 
 	return errs
+}
+
+// maxValidationAttributeDistance is the maximum Levenshtein distance we'll
+// tolerate when searching for attribute names the user might have meant to
+// type.
+const maxValidationAttributeDistance = 2
+
+// findClosestKey finds the closest attribute name in the given map to the
+// supplied needle, where "closest" means the name with the smallest Levenshtein
+// distance from the needle. The haystack will be sorted so that in the event
+// multiple attributes have the same distance, the result will be deterministic
+// (and be the first alphabetically).
+func findClosestKey(
+	needle string,
+	haystack map[string]interface{},
+	maxDistance int,
+) string {
+	match := ""
+	closest := maxDistance + 1
+
+	keys := maps.Keys(haystack)
+	slices.Sort(keys)
+
+	for _, key := range keys {
+		d := levenshtein.DistanceForStrings(
+			[]rune(strings.ToLower(needle)),
+			[]rune(strings.ToLower(key)),
+			levenshtein.DefaultOptionsWithSub,
+		)
+
+		if d == 0 {
+			// We can't do better than 0 so we can short circuit in this case. Note
+			// that a distance of 0 is possible since we lowercase the strings prior
+			// to checking the Levenshtein distance, so e.g. "Name" and "NAME" will
+			// become "name"/"name" and yield a distance of 0.
+			return key
+		} else if d < closest {
+			closest = d
+			match = key
+		} else {
+			continue
+		}
+	}
+
+	return match
+}
+
+// getSchemaPathAttributes walks the given path into the project schema and
+// returns a list of attributes that can be subsequently traversed at the end of
+// that path.
+func getSchemaPathAttributes(path string) map[string]interface{} {
+	elements := strings.Split(path, "/")
+	isNumber := regexp.MustCompile(`^\d+$`)
+
+	curr := ProjectSchema
+	for len(elements) > 0 {
+		attr := elements[0]
+		elements = elements[1:]
+
+		if attr == "" {
+			continue
+		}
+
+		// If this schema node references another, continue from there.
+		if curr.Ref != nil {
+			curr = curr.Ref
+		}
+
+		// Check properties for matching attributes.
+		if schema, ok := curr.Properties[attr]; ok {
+			curr = schema
+			continue
+		}
+
+		// Check additional properties.
+		if curr.AdditionalProperties != nil {
+			if additional, ok := curr.AdditionalProperties.(map[string]*jsonschema.Schema); ok {
+				if schema, ok := additional[attr]; ok {
+					curr = schema
+					continue
+				}
+			}
+		}
+
+		// If the attribute is numeric, check for an array that can be indexed.
+		if isNumber.MatchString(attr) && curr.Items2020 != nil {
+			curr = curr.Items2020
+			continue
+		}
+
+		// In all other cases we can't traverse the supplied path.
+		return nil
+	}
+
+	// If we end on a reference, resolve it to the actual element before
+	// enumerating attributes.
+	if curr.Ref != nil {
+		curr = curr.Ref
+	}
+
+	knownProperties := make(map[string]interface{})
+	for k, v := range curr.Properties {
+		knownProperties[k] = v
+	}
+
+	if curr.AdditionalProperties != nil {
+		if additional, ok := curr.AdditionalProperties.(map[string]*jsonschema.Schema); ok {
+			for k, v := range additional {
+				knownProperties[k] = v
+			}
+		}
+	}
+
+	return knownProperties
 }
 
 func InferFullTypeName(typeName string, itemsType *ProjectConfigItemsType) string {
@@ -387,7 +567,6 @@ func InferFullTypeName(typeName string, itemsType *ProjectConfigItemsType) strin
 // We use this to validate the default config values alongside their type definition but
 // also to validate config values coming from individual stacks.
 func ValidateConfigValue(typeName string, itemsType *ProjectConfigItemsType, value interface{}) bool {
-
 	if typeName == stringTypeName {
 		_, ok := value.(string)
 		return ok
@@ -479,7 +658,6 @@ func (proj *Project) Validate() error {
 						inferredTypeName)
 				}
 			}
-
 		} else {
 			// when not namespaced by project, there shouldn't be a type, only a value
 			if configType.IsExplicitlyTyped() {
@@ -505,18 +683,14 @@ func (proj *Project) Validate() error {
 	return nil
 }
 
-// TrustResourceDependencies returns whether this project's runtime can be trusted to accurately report
-// dependencies. All languages supported by Pulumi today do this correctly. This option remains useful when bringing
-// up new Pulumi languages.
-func (proj *Project) TrustResourceDependencies() bool {
-	return true
-}
-
 // Save writes a project definition to a file.
 func (proj *Project) Save(path string) error {
-	contract.Require(path != "", "path")
-	contract.Require(proj != nil, "proj")
-	contract.Requiref(proj.Validate() == nil, "proj", "Validate()")
+	contract.Requiref(path != "", "path", "must not be empty")
+	contract.Requiref(proj != nil, "proj", "must not be nil")
+
+	err := proj.Validate()
+	contract.Requiref(err == nil, "proj", "Validate(): %v", err)
+
 	return save(path, proj, false /*mkDirAll*/)
 }
 
@@ -557,8 +731,8 @@ func (proj *PolicyPackProject) Validate() error {
 
 // Save writes a project definition to a file.
 func (proj *PolicyPackProject) Save(path string) error {
-	contract.Require(path != "", "path")
-	contract.Require(proj != nil, "proj")
+	contract.Requiref(path != "", "path", "must not be empty")
+	contract.Requiref(proj != nil, "proj", "must not be nil")
 	contract.Requiref(proj.Validate() == nil, "proj", "Validate()")
 	return save(path, proj, false /*mkDirAll*/)
 }
@@ -576,6 +750,236 @@ func (proj *PluginProject) Validate() error {
 	return nil
 }
 
+type Environment struct {
+	envs    []string
+	message json.RawMessage
+	node    *yaml.Node
+}
+
+func NewEnvironment(envs []string) *Environment {
+	return &Environment{envs: envs}
+}
+
+func (e *Environment) Definition() []byte {
+	switch {
+	case e == nil:
+		// If there's no environment, return nil.
+		return nil
+	case len(e.envs) != 0:
+		// If the environment was a list of environments, create an anonymous environment and return it.
+		bytes, err := json.Marshal(map[string]any{"imports": e.envs})
+		if err != nil {
+			return nil
+		}
+		return bytes
+	case e.message != nil:
+		// If the environment was encoded as JSON, return the raw JSON.
+		return e.message
+	case e.node != nil:
+		// Re-encode the YAML and return it.
+		bytes, err := yaml.Marshal(e.node)
+		if err != nil {
+			return nil
+		}
+		return bytes
+	default:
+		return nil
+	}
+}
+
+func (e *Environment) Imports() []string {
+	def, diags, err := eval.LoadYAMLBytes("yaml", e.Definition())
+	if err != nil || len(diags) != 0 || def == nil {
+		return nil
+	}
+	names := fx.ToSlice(fx.Map(fx.IterSlice(def.Imports.GetElements()), func(imp *ast.ImportDecl) string {
+		return imp.Environment.GetValue()
+	}))
+	if len(def.Values.GetEntries()) != 0 {
+		names = append(names, "yaml")
+	}
+	return names
+}
+
+func (e *Environment) Append(envs ...string) *Environment {
+	switch {
+	case e == nil:
+		// The stack has no environment block. Create one that imports the named environments.
+		return NewEnvironment(envs)
+	case e.message != nil:
+		// The environment definition is inline JSON. Append the named environments to the import list,
+		// creating the list if necessary.
+		var m map[string]any
+		if err := json.Unmarshal(e.message, &m); err == nil {
+			imports, _ := m["imports"].([]any)
+			anys := fx.ToSlice(fx.Map(fx.IterSlice(envs), func(e string) any { return e }))
+			m["imports"] = append(imports, anys...)
+			if new, err := json.Marshal(m); err == nil {
+				e.message = new
+			}
+		}
+		return e
+	case e.node != nil:
+		// The environment definition is inline YAML.
+		// - If there is no import list, add one, then append the named envs to the import list
+		// - If there is an import list, append the named envs to the import list
+		root := e.node
+		if root.Kind == yaml.MappingNode {
+			var imports *yaml.Node
+			for i := 0; i < len(root.Content); i += 2 {
+				key := root.Content[i]
+				if key.Kind == yaml.ScalarNode && key.Value == "imports" {
+					imports = root.Content[i+1]
+					break
+				}
+			}
+			if imports == nil {
+				root.Content = append([]*yaml.Node{
+					{
+						Kind:  yaml.ScalarNode,
+						Style: root.Style,
+						Tag:   "!!str",
+						Value: "imports",
+					},
+					{
+						Kind:  yaml.SequenceNode,
+						Style: root.Style,
+					},
+				}, root.Content...)
+				imports = root.Content[1]
+			}
+			if imports.Kind == yaml.SequenceNode {
+				nodes := fx.ToSlice(fx.Map(fx.IterSlice(envs), func(env string) *yaml.Node {
+					return &yaml.Node{
+						Kind:  yaml.ScalarNode,
+						Style: imports.Style,
+						Tag:   "!!str",
+						Value: env,
+					}
+				}))
+				imports.Content = append(imports.Content, nodes...)
+				return e
+			}
+		}
+		return e
+	default:
+		// The environment definition is just a list of environments. Append to the list.
+		e.envs = append(e.envs, envs...)
+		return e
+	}
+}
+
+func (e *Environment) Remove(env string) *Environment {
+	switch {
+	case e == nil:
+		// There is no environment block, so there's nothing to remove.
+		return nil
+	case e.message != nil:
+		// The environment definition is inline JSON. Find the last occurrence of the named environment in the import
+		// list and remove it.
+		var m map[string]any
+		if err := json.Unmarshal(e.message, &m); err == nil {
+			if imports, ok := m["imports"].([]any); ok {
+				for i := len(imports) - 1; i >= 0; i-- {
+					match := false
+					switch e := imports[i].(type) {
+					case string:
+						match = e == env
+					case map[string]any:
+						match = len(e) == 1 && maps.Keys(e)[0] == env
+					}
+					if match {
+						m["imports"] = append(imports[:i], imports[i+1:]...)
+						if new, err := json.Marshal(m); err == nil {
+							e.message = new
+						}
+						return e
+					}
+				}
+			}
+		}
+		return e
+	case e.node != nil:
+		// The environment definition is inline YAML. Find the last occurrence of the named environment in the import
+		// list and remove it.
+		root := e.node
+		if root.Kind == yaml.MappingNode {
+			for i := 0; i < len(root.Content); i += 2 {
+				key := root.Content[i]
+				if key.Kind == yaml.ScalarNode && key.Value == "imports" {
+					value := root.Content[i+1]
+					if value.Kind == yaml.SequenceNode {
+						for j := len(value.Content) - 1; j >= 0; j-- {
+							n := value.Content[j]
+
+							match := false
+							switch n.Kind {
+							case yaml.ScalarNode:
+								match = n.Value == env
+							case yaml.MappingNode:
+								match = len(n.Content) == 2 && n.Content[0].Value == env
+							case yaml.SequenceNode, yaml.AliasNode, yaml.DocumentNode:
+								// These nodes never match, so we can ignore them here.
+							}
+							if match {
+								value.Content = append(value.Content[:j], value.Content[j+1:]...)
+								if len(value.Content) == 0 {
+									root.Content = append(root.Content[:i], root.Content[i+2:]...)
+								}
+								return e
+							}
+						}
+					}
+				}
+			}
+		}
+		return e
+	default:
+		// The environment definition is just a list of environments. Find the last occurrence of the named environment
+		// in the list and remove it.
+		for i := len(e.envs) - 1; i >= 0; i-- {
+			n := e.envs[i]
+			if n == env {
+				e.envs = append(e.envs[:i], e.envs[i+1:]...)
+				if len(e.envs) == 0 {
+					return nil
+				}
+				return e
+			}
+		}
+		return e
+	}
+}
+
+func (e Environment) MarshalJSON() ([]byte, error) {
+	if e.message == nil {
+		return json.Marshal(e.envs)
+	}
+	return json.Marshal(e.message)
+}
+
+func (e *Environment) UnmarshalJSON(b []byte) error {
+	if err := json.Unmarshal(b, &e.envs); err == nil {
+		return nil
+	}
+	return json.Unmarshal(b, &e.message)
+}
+
+func (e Environment) MarshalYAML() (any, error) {
+	if e.node == nil {
+		return e.envs, nil
+	}
+	return e.node, nil
+}
+
+func (e *Environment) UnmarshalYAML(n *yaml.Node) error {
+	if err := n.Decode(&e.envs); err == nil {
+		return nil
+	}
+	e.node = n
+	return nil
+}
+
 // ProjectStack holds stack specific information about a project.
 type ProjectStack struct {
 	// SecretsProvider is this stack's secrets provider.
@@ -588,9 +992,15 @@ type ProjectStack struct {
 	EncryptionSalt string `json:"encryptionsalt,omitempty" yaml:"encryptionsalt,omitempty"`
 	// Config is an optional config bag.
 	Config config.Map `json:"config,omitempty" yaml:"config,omitempty"`
+	// Environment is an optional environment definition or list of environments.
+	Environment *Environment `json:"environment,omitempty" yaml:"environment,omitempty"`
 
 	// The original byte representation of the file, used to attempt trivia-preserving edits
 	raw []byte
+}
+
+func (ps ProjectStack) EnvironmentBytes() []byte {
+	return ps.Environment.Definition()
 }
 
 func (ps ProjectStack) RawValue() []byte {
@@ -599,14 +1009,24 @@ func (ps ProjectStack) RawValue() []byte {
 
 // Save writes a project definition to a file.
 func (ps *ProjectStack) Save(path string) error {
-	contract.Require(path != "", "path")
-	contract.Require(ps != nil, "ps")
+	contract.Requiref(path != "", "path", "must not be empty")
+	contract.Requiref(ps != nil, "ps", "must not be nil")
 	return save(path, ps, true /*mkDirAll*/)
 }
 
 type ProjectRuntimeInfo struct {
 	name    string
 	options map[string]interface{}
+}
+
+type ProjectStackDeployment struct {
+	DeploymentSettings apitype.DeploymentSettings `json:"settings" yaml:"settings"`
+}
+
+func (psd *ProjectStackDeployment) Save(path string) error {
+	contract.Requiref(path != "", "path", "must not be empty")
+	contract.Requiref(psd != nil, "ps", "must not be nil")
+	return save(path, psd, true /*mkDirAll*/)
 }
 
 func NewProjectRuntimeInfo(name string, options map[string]interface{}) ProjectRuntimeInfo {
@@ -632,7 +1052,7 @@ func (info *ProjectRuntimeInfo) SetOption(key string, value interface{}) {
 }
 
 func (info ProjectRuntimeInfo) MarshalYAML() (interface{}, error) {
-	if info.options == nil || len(info.options) == 0 {
+	if len(info.options) == 0 {
 		return info.name, nil
 	}
 
@@ -643,7 +1063,7 @@ func (info ProjectRuntimeInfo) MarshalYAML() (interface{}, error) {
 }
 
 func (info ProjectRuntimeInfo) MarshalJSON() ([]byte, error) {
-	if info.options == nil || len(info.options) == 0 {
+	if len(info.options) == 0 {
 		return json.Marshal(info.name)
 	}
 
@@ -702,8 +1122,8 @@ func marshallerForPath(path string) (encoding.Marshaler, error) {
 }
 
 func save(path string, value interface{}, mkDirAll bool) error {
-	contract.Require(path != "", "path")
-	contract.Require(value != nil, "value")
+	contract.Requiref(path != "", "path", "must not be empty")
+	contract.Requiref(value != nil, "value", "must not be nil")
 
 	m, err := marshallerForPath(path)
 	if err != nil {
@@ -716,11 +1136,40 @@ func save(path string, value interface{}, mkDirAll bool) error {
 	}
 
 	if mkDirAll {
-		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
 	}
 
 	//nolint:gosec
-	return os.WriteFile(path, b, 0644)
+	return os.WriteFile(path, b, 0o644)
+}
+
+// To mitigate an import cycle, we define this here.
+const PulumiTagsConfigKey = "pulumi:tags"
+
+// AddConfigStackTags sets the project tags config to the given map of tags.
+func (proj *Project) AddConfigStackTags(tags map[string]string) {
+	if proj.Config == nil {
+		proj.Config = map[string]ProjectConfigType{}
+	}
+	configTags, has := proj.Config["pulumi:tags"]
+	if !has {
+		configTags = ProjectConfigType{
+			Value: map[string]string{},
+		}
+	}
+	if configTags.Value == nil {
+		configTags.Value = map[string]string{}
+	}
+
+	tagMap, ok := configTags.Value.(map[string]string)
+	if !ok {
+		logging.Warningf("overwriting non-object `%s` project config", "pulumi:tags")
+		tagMap = map[string]string{}
+	}
+	for k, v := range tags {
+		tagMap[k] = v
+	}
+	proj.Config["pulumi:tags"] = configTags
 }

@@ -1,4 +1,4 @@
-// Copyright 2016-2021, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -82,6 +82,26 @@ namespace {{.Namespace}}
             return dst;
         }
 
+        public static global::Pulumi.InvokeOutputOptions WithDefaults(this global::Pulumi.InvokeOutputOptions? src)
+        {
+            var dst = src ?? new global::Pulumi.InvokeOutputOptions{};
+            dst.Version = src?.Version ?? Version;{{if ne .PluginDownloadURL "" }}
+            dst.PluginDownloadURL = src?.PluginDownloadURL ?? "{{.PluginDownloadURL}}";{{end}}
+            return dst;
+        }
+{{if .HasParameterization }}
+        public static global::Pulumi.RegisterPackageRequest PackageParameterization()
+        {
+            return new global::Pulumi.RegisterPackageRequest(
+                name: "{{.BaseProviderName}}",
+                version: "{{.BaseProviderVersion}}",
+                downloadUrl: "{{.BaseProviderPluginDownloadURL}}",
+                parameterization: new global::Pulumi.RegisterPackageRequest.PackageParameterization(
+                    name: "{{.PackageName}}",
+                    version: "{{.PackageVersion}}",
+                    value: global::System.Convert.FromBase64String("{{.ParameterValue}}")));
+        }
+{{end}}
         private readonly static string version;
         public static string Version => version;
 
@@ -112,11 +132,18 @@ namespace {{.Namespace}}
 var csharpUtilitiesTemplate = template.Must(template.New("CSharpUtilities").Parse(csharpUtilitiesTemplateText))
 
 type csharpUtilitiesTemplateContext struct {
-	Name              string
-	Namespace         string
-	ClassName         string
-	Tool              string
-	PluginDownloadURL string
+	Name                          string
+	Namespace                     string
+	ClassName                     string
+	Tool                          string
+	PluginDownloadURL             string
+	HasParameterization           bool
+	PackageName                   string
+	PackageVersion                string
+	BaseProviderName              string
+	BaseProviderVersion           string
+	BaseProviderPluginDownloadURL string
+	ParameterValue                string
 }
 
 // TODO(pdg): parameterize package name
@@ -131,10 +158,13 @@ const csharpProjectFileTemplateText = `<Project Sdk="Microsoft.NET.Sdk">
     <PackageProjectUrl>{{.Package.Homepage}}</PackageProjectUrl>
     <RepositoryUrl>{{.Package.Repository}}</RepositoryUrl>
     <PackageIcon>logo.png</PackageIcon>
+    {{- if .Version }}
+    <Version>{{.Version}}</Version>
+    {{- end }}
 
-    <TargetFramework>netcoreapp3.1</TargetFramework>
+    {{/* TargetFramework should be kept as low as possible, it does not need updating when we change LTS support */ -}}
+    <TargetFramework>net6.0</TargetFramework>
     <Nullable>enable</Nullable>
-    <UseSharedCompilation>false</UseSharedCompilation>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
@@ -151,7 +181,11 @@ const csharpProjectFileTemplateText = `<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup Condition="'$(GITHUB_ACTIONS)' == 'true'">
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
   </PropertyGroup>
-
+{{ if .RestoreSources }}
+  <PropertyGroup>
+    <RestoreSources>{{.RestoreSources}};$(RestoreSources)</RestoreSources>
+  </PropertyGroup>
+{{ end }}
   <ItemGroup>
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="1.0.0" PrivateAssets="All" />
   </ItemGroup>
@@ -161,7 +195,7 @@ const csharpProjectFileTemplateText = `<Project Sdk="Microsoft.NET.Sdk">
     <None Include="version.txt" Pack="True" PackagePath="content" />
   </ItemGroup>
 
-   <ItemGroup>
+  <ItemGroup>
     <EmbeddedResource Include="pulumi-plugin.json" />
     <None Include="pulumi-plugin.json" Pack="True" PackagePath="content" />
   </ItemGroup>
@@ -205,4 +239,5 @@ type csharpProjectFileTemplateContext struct {
 	PackageReferences map[string]string
 	ProjectReferences []string
 	Version           string
+	RestoreSources    string
 }

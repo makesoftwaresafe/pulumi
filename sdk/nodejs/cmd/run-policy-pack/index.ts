@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Enable source map support so we get good stack traces.
+import "source-map-support/register";
+
 // The very first thing we do is set up unhandled exception and rejection hooks to ensure that these
 // events cause us to exit with a non-zero code. It is critically important that we do this early:
 // if we do not, unhandled rejections in particular may cause us to exit with a 0 exit code, which
@@ -33,7 +36,7 @@ let programRunning = false;
 const uncaughtHandler = (err: Error) => {
     uncaughtErrors.add(err);
     if (!programRunning) {
-        console.error(err.stack || err.message || ("" + err));
+        console.error(err.stack || err.message || "" + err);
     }
 };
 
@@ -43,7 +46,7 @@ const uncaughtHandler = (err: Error) => {
 //
 // 32 was picked so as to be very unlikely to collide with any of the error codes documented by
 // nodejs here:
-// https://github.com/nodejs/node-v0.x-archive/blob/master/doc/api/process.markdown#exit-codes
+// https://nodejs.org/api/process.html#process_exit_codes
 const nodeJSProcessExitedAfterLoggingUserActionableMessage = 32;
 
 process.on("uncaughtException", uncaughtHandler);
@@ -81,11 +84,10 @@ import * as v8Hooks from "../../runtime/closure/v8Hooks";
 import minimist from "minimist";
 
 function usage(): void {
-    console.error(`usage: RUN <engine-address> <program>`);
+    console.error("usage: RUN <engine-address> <program>");
 }
 
-function printErrorUsageAndExit(message: string): never {
-    console.error(message);
+function printUsageAndExit(): never {
     usage();
     return process.exit(-1);
 }
@@ -96,7 +98,7 @@ function main(args: string[]): void {
 
     // Finally, ensure we have a program to run.
     if (argv._.length < 2) {
-        return printErrorUsageAndExit("error: Usage: RUN <engine-address> <program>");
+        return printUsageAndExit();
     }
 
     // Remove <engine-address> so we simply execute the program.
@@ -106,7 +108,9 @@ function main(args: string[]): void {
     v8Hooks.isInitializedAsync().then(() => {
         const promise: Promise<void> = require("./run").run({
             argv,
-            programStarted: () => (programRunning = true),
+            programStarted: () => {
+                programRunning = true;
+            },
             reportLoggedError: (err: Error) => loggedErrors.add(err),
             runInStack: false,
             typeScript: true, // Should have no deleterious impact on JS codebases.

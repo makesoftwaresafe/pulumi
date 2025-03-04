@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,19 @@
 package providers
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/blang/semver"
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
@@ -32,54 +37,64 @@ import (
 
 type testPluginHost struct {
 	t             *testing.T
-	provider      func(pkg tokens.Package, version *semver.Version) (plugin.Provider, error)
+	provider      func(descriptor workspace.PackageDescriptor) (plugin.Provider, error)
 	closeProvider func(provider plugin.Provider) error
 }
 
 func (host *testPluginHost) SignalCancellation() error {
 	return nil
 }
+
 func (host *testPluginHost) Close() error {
 	return nil
 }
+
 func (host *testPluginHost) ServerAddr() string {
 	host.t.Fatalf("Host RPC address not available")
 	return ""
 }
+
 func (host *testPluginHost) Log(sev diag.Severity, urn resource.URN, msg string, streamID int32) {
 	host.t.Logf("[%v] %v@%v: %v", sev, urn, streamID, msg)
 }
+
 func (host *testPluginHost) LogStatus(sev diag.Severity, urn resource.URN, msg string, streamID int32) {
 	host.t.Logf("[%v] %v@%v: %v", sev, urn, streamID, msg)
 }
+
 func (host *testPluginHost) Analyzer(nm tokens.QName) (plugin.Analyzer, error) {
 	return nil, errors.New("unsupported")
 }
+
 func (host *testPluginHost) PolicyAnalyzer(name tokens.QName, path string,
-	opts *plugin.PolicyAnalyzerOptions) (plugin.Analyzer, error) {
+	opts *plugin.PolicyAnalyzerOptions,
+) (plugin.Analyzer, error) {
 	return nil, errors.New("unsupported")
 }
+
 func (host *testPluginHost) ListAnalyzers() []plugin.Analyzer {
 	return nil
 }
-func (host *testPluginHost) Provider(pkg tokens.Package, version *semver.Version) (plugin.Provider, error) {
-	return host.provider(pkg, version)
+
+func (host *testPluginHost) Provider(descriptor workspace.PackageDescriptor) (plugin.Provider, error) {
+	return host.provider(descriptor)
 }
+
 func (host *testPluginHost) CloseProvider(provider plugin.Provider) error {
 	return host.closeProvider(provider)
 }
-func (host *testPluginHost) LanguageRuntime(
-	root, pwd, runtime string, options map[string]interface{}) (plugin.LanguageRuntime, error) {
+
+func (host *testPluginHost) LanguageRuntime(root string, info plugin.ProgramInfo) (plugin.LanguageRuntime, error) {
 	return nil, errors.New("unsupported")
 }
+
 func (host *testPluginHost) EnsurePlugins(plugins []workspace.PluginSpec, kinds plugin.Flags) error {
 	return nil
 }
-func (host *testPluginHost) InstallPlugin(plugin workspace.PluginSpec) error {
-	return nil
-}
+
 func (host *testPluginHost) ResolvePlugin(
-	kind workspace.PluginKind, name string, version *semver.Version) (*workspace.PluginInfo, error) {
+	kind apitype.PluginKind, name string, version *semver.Version,
+) (*workspace.PluginInfo, error) {
 	return nil, nil
 }
 
@@ -87,12 +102,19 @@ func (host *testPluginHost) GetProjectPlugins() []workspace.ProjectPlugin {
 	return nil
 }
 
-func (host *testPluginHost) GetRequiredPlugins(info plugin.ProgInfo,
-	kinds plugin.Flags) ([]workspace.PluginInfo, error) {
+func (host *testPluginHost) GetRequiredPlugins(project string, info plugin.ProgramInfo,
+	kinds plugin.Flags,
+) ([]workspace.PluginInfo, error) {
 	return nil, nil
 }
 
+func (host *testPluginHost) StartDebugging(plugin.DebuggingInfo) error {
+	return nil
+}
+
 type testProvider struct {
+	plugin.UnimplementedProvider
+
 	pkg         tokens.Package
 	version     semver.Version
 	configured  bool
@@ -102,84 +124,56 @@ type testProvider struct {
 	config     func(resource.PropertyMap) error
 }
 
-func (prov *testProvider) SignalCancellation() error {
-	return nil
-}
-func (prov *testProvider) Close() error {
-	return nil
-}
 func (prov *testProvider) Pkg() tokens.Package {
 	return prov.pkg
 }
-func (prov *testProvider) GetSchema(version int) ([]byte, error) {
-	return []byte("{}"), nil
+
+func (prov *testProvider) GetSchema(
+	context.Context, plugin.GetSchemaRequest,
+) (plugin.GetSchemaResponse, error) {
+	return plugin.GetSchemaResponse{Schema: []byte("{}")}, nil
 }
-func (prov *testProvider) CheckConfig(urn resource.URN, olds,
-	news resource.PropertyMap, allowUnknowns bool) (resource.PropertyMap, []plugin.CheckFailure, error) {
-	return prov.checkConfig(urn, olds, news, allowUnknowns)
+
+func (prov *testProvider) CheckConfig(
+	_ context.Context, req plugin.CheckConfigRequest,
+) (plugin.CheckConfigResponse, error) {
+	props, failures, err := prov.checkConfig(req.URN, req.Olds, req.News, req.AllowUnknowns)
+	return plugin.CheckConfigResponse{Properties: props, Failures: failures}, err
 }
-func (prov *testProvider) DiffConfig(urn resource.URN, olds, news resource.PropertyMap,
-	allowUnknowns bool, ignoreChanges []string) (plugin.DiffResult, error) {
-	return prov.diffConfig(urn, olds, news, allowUnknowns, ignoreChanges)
+
+func (prov *testProvider) DiffConfig(
+	_ context.Context, req plugin.DiffConfigRequest,
+) (plugin.DiffConfigResponse, error) {
+	return prov.diffConfig(req.URN, req.OldOutputs, req.NewInputs, req.AllowUnknowns, req.IgnoreChanges)
 }
-func (prov *testProvider) Configure(inputs resource.PropertyMap) error {
-	if err := prov.config(inputs); err != nil {
-		return err
+
+func (prov *testProvider) Configure(
+	_ context.Context, req plugin.ConfigureRequest,
+) (plugin.ConfigureResponse, error) {
+	if err := prov.config(req.Inputs); err != nil {
+		return plugin.ConfigureResponse{}, err
 	}
 	prov.configured = true
-	return nil
+	return plugin.ConfigureResponse{}, nil
 }
-func (prov *testProvider) Check(urn resource.URN,
-	olds, news resource.PropertyMap, _ bool, _ []byte) (resource.PropertyMap, []plugin.CheckFailure, error) {
-	return nil, nil, errors.New("unsupported")
-}
-func (prov *testProvider) Create(urn resource.URN, props resource.PropertyMap, timeout float64,
-	preview bool) (resource.ID, resource.PropertyMap, resource.Status, error) {
-	return "", nil, resource.StatusOK, errors.New("unsupported")
-}
-func (prov *testProvider) Read(urn resource.URN, id resource.ID,
-	inputs, state resource.PropertyMap) (plugin.ReadResult, resource.Status, error) {
-	return plugin.ReadResult{}, resource.StatusUnknown, errors.New("unsupported")
-}
-func (prov *testProvider) Diff(urn resource.URN, id resource.ID,
-	olds resource.PropertyMap, news resource.PropertyMap, _ bool, _ []string) (plugin.DiffResult, error) {
-	return plugin.DiffResult{}, errors.New("unsupported")
-}
-func (prov *testProvider) Update(urn resource.URN, id resource.ID,
-	olds resource.PropertyMap, news resource.PropertyMap, timeout float64,
-	ignoreChanges []string, preview bool) (resource.PropertyMap, resource.Status, error) {
-	return nil, resource.StatusOK, errors.New("unsupported")
-}
-func (prov *testProvider) Delete(urn resource.URN,
-	id resource.ID, props resource.PropertyMap, timeout float64) (resource.Status, error) {
-	return resource.StatusOK, errors.New("unsupported")
-}
-func (prov *testProvider) Construct(info plugin.ConstructInfo, typ tokens.Type, name tokens.QName, parent resource.URN,
-	inputs resource.PropertyMap, options plugin.ConstructOptions) (plugin.ConstructResult, error) {
-	return plugin.ConstructResult{}, errors.New("unsupported")
-}
-func (prov *testProvider) Invoke(tok tokens.ModuleMember,
-	args resource.PropertyMap) (resource.PropertyMap, []plugin.CheckFailure, error) {
-	return nil, nil, errors.New("unsupported")
-}
-func (prov *testProvider) StreamInvoke(
-	tok tokens.ModuleMember, args resource.PropertyMap,
-	onNext func(resource.PropertyMap) error) ([]plugin.CheckFailure, error) {
 
-	return nil, fmt.Errorf("not implemented")
-}
-func (prov *testProvider) Call(tok tokens.ModuleMember, args resource.PropertyMap, info plugin.CallInfo,
-	options plugin.CallOptions) (plugin.CallResult, error) {
-	return plugin.CallResult{}, errors.New("unsupported")
-}
-func (prov *testProvider) GetPluginInfo() (workspace.PluginInfo, error) {
+func (prov *testProvider) GetPluginInfo(context.Context) (workspace.PluginInfo, error) {
 	return workspace.PluginInfo{
 		Name:    "testProvider",
 		Version: &prov.version,
 	}, nil
 }
-func (prov *testProvider) GetMapping(key string) ([]byte, string, error) {
-	return nil, "", nil
+
+func (prov *testProvider) GetMapping(
+	context.Context, plugin.GetMappingRequest,
+) (plugin.GetMappingResponse, error) {
+	return plugin.GetMappingResponse{}, nil
+}
+
+func (prov *testProvider) GetMappings(
+	context.Context, plugin.GetMappingsRequest,
+) (plugin.GetMappingsResponse, error) {
+	return plugin.GetMappingsResponse{}, nil
 }
 
 type providerLoader struct {
@@ -191,14 +185,14 @@ type providerLoader struct {
 func newPluginHost(t *testing.T, loaders []*providerLoader) plugin.Host {
 	return &testPluginHost{
 		t: t,
-		provider: func(pkg tokens.Package, ver *semver.Version) (plugin.Provider, error) {
+		provider: func(descriptor workspace.PackageDescriptor) (plugin.Provider, error) {
 			var best *providerLoader
 			for _, l := range loaders {
-				if l.pkg != pkg {
+				if string(l.pkg) != descriptor.Name {
 					continue
 				}
 
-				if ver != nil && l.version.LT(*ver) {
+				if descriptor.Version != nil && l.version.LT(*descriptor.Version) {
 					continue
 				}
 				if best == nil || l.version.GT(best.version) {
@@ -217,8 +211,8 @@ func newPluginHost(t *testing.T, loaders []*providerLoader) plugin.Host {
 }
 
 func newLoader(t *testing.T, pkg, version string,
-	load func(tokens.Package, semver.Version) (plugin.Provider, error)) *providerLoader {
-
+	load func(tokens.Package, semver.Version) (plugin.Provider, error),
+) *providerLoader {
 	var ver semver.Version
 	if version != "" {
 		v, err := semver.ParseTolerant(version)
@@ -245,11 +239,13 @@ func newSimpleLoader(t *testing.T, pkg, version string, config func(resource.Pro
 			pkg:     pkg,
 			version: ver,
 			checkConfig: func(urn resource.URN, olds,
-				news resource.PropertyMap, allowUnknowns bool) (resource.PropertyMap, []plugin.CheckFailure, error) {
+				news resource.PropertyMap, allowUnknowns bool,
+			) (resource.PropertyMap, []plugin.CheckFailure, error) {
 				return news, nil, nil
 			},
 			diffConfig: func(urn resource.URN, olds, news resource.PropertyMap,
-				allowUnknowns bool, ignoreChanges []string) (plugin.DiffResult, error) {
+				allowUnknowns bool, ignoreChanges []string,
+			) (plugin.DiffResult, error) {
 				return plugin.DiffResult{}, nil
 			},
 			config: config,
@@ -257,9 +253,9 @@ func newSimpleLoader(t *testing.T, pkg, version string, config func(resource.Pro
 	})
 }
 
-func newProviderState(pkg, name, id string, delete bool, inputs resource.PropertyMap) *resource.State {
+func newProviderState(pkg, name, id string, del bool, inputs resource.PropertyMap) *resource.State {
 	typ := MakeProviderType(tokens.Package(pkg))
-	urn := resource.NewURN("test", "test", "", typ, tokens.QName(name))
+	urn := resource.NewURN("test", "test", "", typ, name)
 	if inputs == nil {
 		inputs = resource.PropertyMap{}
 	}
@@ -267,7 +263,7 @@ func newProviderState(pkg, name, id string, delete bool, inputs resource.Propert
 		Type:   typ,
 		URN:    urn,
 		Custom: true,
-		Delete: delete,
+		Delete: del,
 		ID:     resource.ID(id),
 		Inputs: inputs,
 	}
@@ -276,12 +272,10 @@ func newProviderState(pkg, name, id string, delete bool, inputs resource.Propert
 func TestNewRegistryNoOldState(t *testing.T) {
 	t.Parallel()
 
-	r, err := NewRegistry(&testPluginHost{}, nil, false, nil)
-	assert.NoError(t, err)
+	r := NewRegistry(&testPluginHost{}, false, nil)
 	assert.NotNil(t, r)
 
-	r, err = NewRegistry(&testPluginHost{}, nil, true, nil)
-	assert.NoError(t, err)
+	r = NewRegistry(&testPluginHost{}, true, nil)
 	assert.NotNil(t, r)
 }
 
@@ -311,17 +305,23 @@ func TestNewRegistryOldState(t *testing.T) {
 	}
 	host := newPluginHost(t, loaders)
 
-	r, err := NewRegistry(host, olds, false, nil)
-	assert.NoError(t, err)
+	r := NewRegistry(host, false, nil)
 	assert.NotNil(t, r)
-
-	assert.Equal(t, len(olds), len(r.providers))
 
 	for _, old := range olds {
 		ref, err := NewReference(old.URN, old.ID)
 		assert.NoError(t, err)
 
 		p, ok := r.GetProvider(ref)
+		assert.False(t, ok)
+		assert.Nil(t, p)
+
+		// "Same" the provider to add it to registry
+		err = r.Same(context.Background(), old)
+		assert.NoError(t, err)
+
+		// Now we should be able to get it
+		p, ok = r.GetProvider(ref)
 		assert.True(t, ok)
 		assert.NotNil(t, p)
 
@@ -332,107 +332,11 @@ func TestNewRegistryOldState(t *testing.T) {
 		ver, err := GetProviderVersion(old.Inputs)
 		assert.NoError(t, err)
 		if ver != nil {
-			info, err := p.GetPluginInfo()
+			info, err := p.GetPluginInfo(context.Background())
 			assert.NoError(t, err)
 			assert.True(t, info.Version.GTE(*ver))
 		}
 	}
-}
-
-func TestNewRegistryOldStateNoProviders(t *testing.T) {
-	t.Parallel()
-
-	olds := []*resource.State{
-		newProviderState("pkgA", "a", "id1", false, nil),
-	}
-	host := newPluginHost(t, []*providerLoader{})
-
-	r, err := NewRegistry(host, olds, false, nil)
-	assert.Error(t, err)
-	assert.Nil(t, r)
-}
-
-func TestNewRegistryOldStateWrongPackage(t *testing.T) {
-	t.Parallel()
-
-	olds := []*resource.State{
-		newProviderState("pkgA", "a", "id1", false, nil),
-	}
-	loaders := []*providerLoader{
-		newSimpleLoader(t, "pkgB", "", nil),
-	}
-	host := newPluginHost(t, loaders)
-
-	r, err := NewRegistry(host, olds, false, nil)
-	assert.Error(t, err)
-	assert.Nil(t, r)
-}
-
-func TestNewRegistryOldStateWrongVersion(t *testing.T) {
-	t.Parallel()
-
-	olds := []*resource.State{
-		newProviderState("pkgA", "a", "id1", false, resource.PropertyMap{
-			"version": resource.NewStringProperty("1.0.0"),
-		}),
-	}
-	loaders := []*providerLoader{
-		newSimpleLoader(t, "pkgA", "0.5.0", nil),
-	}
-	host := newPluginHost(t, loaders)
-
-	r, err := NewRegistry(host, olds, false, nil)
-	assert.Error(t, err)
-	assert.Nil(t, r)
-}
-
-func TestNewRegistryOldStateNoID(t *testing.T) {
-	t.Parallel()
-
-	olds := []*resource.State{
-		newProviderState("pkgA", "a", "", false, nil),
-	}
-	loaders := []*providerLoader{
-		newSimpleLoader(t, "pkgA", "", nil),
-	}
-	host := newPluginHost(t, loaders)
-
-	r, err := NewRegistry(host, olds, false, nil)
-	assert.Error(t, err)
-	assert.Nil(t, r)
-}
-
-func TestNewRegistryOldStateUnknownID(t *testing.T) {
-	t.Parallel()
-
-	olds := []*resource.State{
-		newProviderState("pkgA", "a", UnknownID, false, nil),
-	}
-	loaders := []*providerLoader{
-		newSimpleLoader(t, "pkgA", "", nil),
-	}
-	host := newPluginHost(t, loaders)
-
-	r, err := NewRegistry(host, olds, false, nil)
-	assert.Error(t, err)
-	assert.Nil(t, r)
-}
-
-func TestNewRegistryOldStateDuplicates(t *testing.T) {
-	t.Parallel()
-
-	olds := []*resource.State{
-		newProviderState("pkgA", "a", "id1", false, nil),
-		newProviderState("pkgA", "a", "id1", false, nil),
-	}
-	loaders := []*providerLoader{
-		newSimpleLoader(t, "pkgA", "", nil),
-	}
-	host := newPluginHost(t, loaders)
-
-	r, err := NewRegistry(host, olds, false, nil)
-	assert.Error(t, err)
-	assert.Nil(t, r)
 }
 
 func TestCRUD(t *testing.T) {
@@ -450,17 +354,23 @@ func TestCRUD(t *testing.T) {
 	}
 	host := newPluginHost(t, loaders)
 
-	r, err := NewRegistry(host, olds, false, nil)
-	assert.NoError(t, err)
+	r := NewRegistry(host, false, nil)
 	assert.NotNil(t, r)
-
-	assert.Equal(t, len(olds), len(r.providers))
 
 	for _, old := range olds {
 		ref, err := NewReference(old.URN, old.ID)
 		assert.NoError(t, err)
 
 		p, ok := r.GetProvider(ref)
+		assert.False(t, ok)
+		assert.Nil(t, p)
+
+		// "Same" the provider to add it to registry
+		err = r.Same(context.Background(), old)
+		assert.NoError(t, err)
+
+		// Now we should be able to get it
+		p, ok = r.GetProvider(ref)
 		assert.True(t, ok)
 		assert.NotNil(t, p)
 
@@ -475,25 +385,36 @@ func TestCRUD(t *testing.T) {
 		timeout := float64(120)
 
 		// Check
-		inputs, failures, err := r.Check(urn, olds, news, false, nil)
+		check, err := r.Check(context.Background(), plugin.CheckRequest{
+			URN:  urn,
+			Olds: olds,
+			News: news,
+		})
 		assert.NoError(t, err)
-		assert.Equal(t, news, inputs)
-		assert.Empty(t, failures)
+		assert.Equal(t, news, check.Properties)
+		assert.Empty(t, check.Failures)
 
 		// Since this is not a preview, the provider should not yet be configured.
-		p, ok := r.GetProvider(Reference{urn: urn, id: UnknownID})
+		p, ok := r.GetProvider(Reference{urn: urn, id: UnconfiguredID})
 		assert.True(t, ok)
 		assert.False(t, p.(*testProvider).configured)
 
 		// Create
-		id, outs, status, err := r.Create(urn, inputs, timeout, false)
+		create, err := r.Create(context.Background(), plugin.CreateRequest{
+			URN:        urn,
+			Name:       urn.Name(),
+			Type:       urn.Type(),
+			Properties: check.Properties,
+			Timeout:    timeout,
+		})
 		assert.NoError(t, err)
-		assert.NotEqual(t, "", id)
-		assert.NotEqual(t, UnknownID, id)
-		assert.Equal(t, resource.PropertyMap{}, outs)
-		assert.Equal(t, resource.StatusOK, status)
+		assert.NotEqual(t, "", create.ID)
+		assert.NotEqual(t, UnconfiguredID, create.ID)
+		assert.NotEqual(t, UnknownID, create.ID)
+		assert.Equal(t, resource.PropertyMap{}, create.Properties)
+		assert.Equal(t, resource.StatusOK, create.Status)
 
-		p2, ok := r.GetProvider(Reference{urn: urn, id: id})
+		p2, ok := r.GetProvider(Reference{urn: urn, id: create.ID})
 		assert.True(t, ok)
 		assert.Equal(t, p, p2)
 		assert.True(t, p2.(*testProvider).configured)
@@ -510,19 +431,28 @@ func TestCRUD(t *testing.T) {
 		assert.True(t, ok)
 
 		// Check
-		inputs, failures, err := r.Check(urn, olds, news, false, nil)
+		check, err := r.Check(context.Background(), plugin.CheckRequest{
+			URN:  urn,
+			Olds: olds,
+			News: news,
+		})
 		assert.NoError(t, err)
-		assert.Equal(t, news, inputs)
-		assert.Empty(t, failures)
+		assert.Equal(t, news, check.Properties)
+		assert.Empty(t, check.Failures)
 
 		// Since this is not a preview, the provider should not yet be configured.
-		p, ok := r.GetProvider(Reference{urn: urn, id: UnknownID})
+		p, ok := r.GetProvider(Reference{urn: urn, id: UnconfiguredID})
 		assert.True(t, ok)
 		assert.False(t, p == old)
 		assert.False(t, p.(*testProvider).configured)
 
 		// Diff
-		diff, err := r.Diff(urn, id, olds, news, false, nil)
+		diff, err := r.Diff(context.Background(), plugin.DiffRequest{
+			URN:        urn,
+			ID:         id,
+			OldOutputs: olds,
+			NewInputs:  news,
+		})
 		assert.NoError(t, err)
 		assert.Equal(t, plugin.DiffResult{Changes: plugin.DiffNone}, diff)
 
@@ -532,10 +462,16 @@ func TestCRUD(t *testing.T) {
 		assert.Equal(t, old, p2)
 
 		// Update
-		outs, status, err := r.Update(urn, id, olds, inputs, timeout, nil, false)
+		update, err := r.Update(context.Background(), plugin.UpdateRequest{
+			URN:        urn,
+			ID:         id,
+			OldOutputs: olds,
+			NewInputs:  check.Properties,
+			Timeout:    timeout,
+		})
 		assert.NoError(t, err)
-		assert.Equal(t, resource.PropertyMap{}, outs)
-		assert.Equal(t, resource.StatusOK, status)
+		assert.Equal(t, resource.PropertyMap{}, update.Properties)
+		assert.Equal(t, resource.StatusOK, update.Status)
 
 		p3, ok := r.GetProvider(Reference{urn: urn, id: id})
 		assert.True(t, ok)
@@ -553,9 +489,15 @@ func TestCRUD(t *testing.T) {
 		assert.True(t, ok)
 
 		// Delete
-		status, err := r.Delete(urn, id, resource.PropertyMap{}, timeout)
+		resp, err := r.Delete(context.Background(), plugin.DeleteRequest{
+			URN:     urn,
+			ID:      id,
+			Inputs:  resource.PropertyMap{},
+			Outputs: resource.PropertyMap{},
+			Timeout: timeout,
+		})
 		assert.NoError(t, err)
-		assert.Equal(t, resource.StatusOK, status)
+		assert.Equal(t, resource.StatusOK, resp.Status)
 
 		_, ok = r.GetProvider(Reference{urn: urn, id: id})
 		assert.False(t, ok)
@@ -580,11 +522,13 @@ func TestCRUDPreview(t *testing.T) {
 				pkg:     pkg,
 				version: ver,
 				checkConfig: func(urn resource.URN, olds,
-					news resource.PropertyMap, allowUnknowns bool) (resource.PropertyMap, []plugin.CheckFailure, error) {
+					news resource.PropertyMap, allowUnknowns bool,
+				) (resource.PropertyMap, []plugin.CheckFailure, error) {
 					return news, nil, nil
 				},
 				diffConfig: func(urn resource.URN, olds, news resource.PropertyMap,
-					allowUnknowns bool, ignoreChanges []string) (plugin.DiffResult, error) {
+					allowUnknowns bool, ignoreChanges []string,
+				) (plugin.DiffResult, error) {
 					// Always reuquire replacement.
 					return plugin.DiffResult{ReplaceKeys: []resource.PropertyKey{"id"}}, nil
 				},
@@ -596,17 +540,23 @@ func TestCRUDPreview(t *testing.T) {
 	}
 	host := newPluginHost(t, loaders)
 
-	r, err := NewRegistry(host, olds, true, nil)
-	assert.NoError(t, err)
+	r := NewRegistry(host, true, nil)
 	assert.NotNil(t, r)
-
-	assert.Equal(t, len(olds), len(r.providers))
 
 	for _, old := range olds {
 		ref, err := NewReference(old.URN, old.ID)
 		assert.NoError(t, err)
 
 		p, ok := r.GetProvider(ref)
+		assert.False(t, ok)
+		assert.Nil(t, p)
+
+		// "Same" the provider to add it to registry
+		err = r.Same(context.Background(), old)
+		assert.NoError(t, err)
+
+		// Now we should be able to get it
+		p, ok = r.GetProvider(ref)
 		assert.True(t, ok)
 		assert.NotNil(t, p)
 
@@ -620,13 +570,17 @@ func TestCRUDPreview(t *testing.T) {
 		olds, news := resource.PropertyMap{}, resource.PropertyMap{}
 
 		// Check
-		inputs, failures, err := r.Check(urn, olds, news, false, nil)
+		check, err := r.Check(context.Background(), plugin.CheckRequest{
+			URN:  urn,
+			Olds: olds,
+			News: news,
+		})
 		assert.NoError(t, err)
-		assert.Equal(t, news, inputs)
-		assert.Empty(t, failures)
+		assert.Equal(t, news, check.Properties)
+		assert.Empty(t, check.Failures)
 
 		// The provider should not be configured: configuration will occur during the previewed Create.
-		p, ok := r.GetProvider(Reference{urn: urn, id: UnknownID})
+		p, ok := r.GetProvider(Reference{urn: urn, id: UnconfiguredID})
 		assert.True(t, ok)
 		assert.False(t, p.(*testProvider).configured)
 	}
@@ -641,19 +595,28 @@ func TestCRUDPreview(t *testing.T) {
 		assert.True(t, ok)
 
 		// Check
-		inputs, failures, err := r.Check(urn, olds, news, false, nil)
+		check, err := r.Check(context.Background(), plugin.CheckRequest{
+			URN:  urn,
+			Olds: olds,
+			News: news,
+		})
 		assert.NoError(t, err)
-		assert.Equal(t, news, inputs)
-		assert.Empty(t, failures)
+		assert.Equal(t, news, check.Properties)
+		assert.Empty(t, check.Failures)
 
 		// The provider should remain unconfigured.
-		p, ok := r.GetProvider(Reference{urn: urn, id: UnknownID})
+		p, ok := r.GetProvider(Reference{urn: urn, id: UnconfiguredID})
 		assert.True(t, ok)
 		assert.False(t, p == old)
 		assert.False(t, p.(*testProvider).configured)
 
 		// Diff
-		diff, err := r.Diff(urn, id, olds, news, false, nil)
+		diff, err := r.Diff(context.Background(), plugin.DiffRequest{
+			URN:        urn,
+			ID:         id,
+			OldOutputs: olds,
+			NewInputs:  news,
+		})
 		assert.NoError(t, err)
 		assert.Equal(t, plugin.DiffResult{Changes: plugin.DiffNone}, diff)
 
@@ -674,19 +637,28 @@ func TestCRUDPreview(t *testing.T) {
 		assert.True(t, ok)
 
 		// Check
-		inputs, failures, err := r.Check(urn, olds, news, false, nil)
+		check, err := r.Check(context.Background(), plugin.CheckRequest{
+			URN:  urn,
+			Olds: olds,
+			News: news,
+		})
 		assert.NoError(t, err)
-		assert.Equal(t, news, inputs)
-		assert.Empty(t, failures)
+		assert.Equal(t, news, check.Properties)
+		assert.Empty(t, check.Failures)
 
 		// The provider should remain unconfigured.
-		p, ok := r.GetProvider(Reference{urn: urn, id: UnknownID})
+		p, ok := r.GetProvider(Reference{urn: urn, id: UnconfiguredID})
 		assert.True(t, ok)
 		assert.False(t, p == old)
 		assert.False(t, p.(*testProvider).configured)
 
 		// Diff
-		diff, err := r.Diff(urn, id, olds, news, false, nil)
+		diff, err := r.Diff(context.Background(), plugin.DiffRequest{
+			URN:        urn,
+			ID:         id,
+			OldOutputs: olds,
+			NewInputs:  news,
+		})
 		assert.NoError(t, err)
 		assert.True(t, diff.Replace())
 
@@ -703,8 +675,7 @@ func TestCRUDNoProviders(t *testing.T) {
 
 	host := newPluginHost(t, []*providerLoader{})
 
-	r, err := NewRegistry(host, []*resource.State{}, false, nil)
-	assert.NoError(t, err)
+	r := NewRegistry(host, false, nil)
 	assert.NotNil(t, r)
 
 	typ := MakeProviderType("pkgA")
@@ -712,10 +683,14 @@ func TestCRUDNoProviders(t *testing.T) {
 	olds, news := resource.PropertyMap{}, resource.PropertyMap{}
 
 	// Check
-	inputs, failures, err := r.Check(urn, olds, news, false, nil)
+	check, err := r.Check(context.Background(), plugin.CheckRequest{
+		URN:  urn,
+		Olds: olds,
+		News: news,
+	})
 	assert.Error(t, err)
-	assert.Empty(t, failures)
-	assert.Nil(t, inputs)
+	assert.Empty(t, check.Failures)
+	assert.Nil(t, check.Properties)
 }
 
 func TestCRUDWrongPackage(t *testing.T) {
@@ -726,8 +701,7 @@ func TestCRUDWrongPackage(t *testing.T) {
 	}
 	host := newPluginHost(t, loaders)
 
-	r, err := NewRegistry(host, []*resource.State{}, false, nil)
-	assert.NoError(t, err)
+	r := NewRegistry(host, false, nil)
 	assert.NotNil(t, r)
 
 	typ := MakeProviderType("pkgA")
@@ -735,10 +709,14 @@ func TestCRUDWrongPackage(t *testing.T) {
 	olds, news := resource.PropertyMap{}, resource.PropertyMap{}
 
 	// Check
-	inputs, failures, err := r.Check(urn, olds, news, false, nil)
+	check, err := r.Check(context.Background(), plugin.CheckRequest{
+		URN:  urn,
+		Olds: olds,
+		News: news,
+	})
 	assert.Error(t, err)
-	assert.Empty(t, failures)
-	assert.Nil(t, inputs)
+	assert.Empty(t, check.Failures)
+	assert.Nil(t, check.Properties)
 }
 
 func TestCRUDWrongVersion(t *testing.T) {
@@ -749,8 +727,7 @@ func TestCRUDWrongVersion(t *testing.T) {
 	}
 	host := newPluginHost(t, loaders)
 
-	r, err := NewRegistry(host, []*resource.State{}, false, nil)
-	assert.NoError(t, err)
+	r := NewRegistry(host, false, nil)
 	assert.NotNil(t, r)
 
 	typ := MakeProviderType("pkgA")
@@ -758,10 +735,14 @@ func TestCRUDWrongVersion(t *testing.T) {
 	olds, news := resource.PropertyMap{}, resource.PropertyMap{"version": resource.NewStringProperty("1.0.0")}
 
 	// Check
-	inputs, failures, err := r.Check(urn, olds, news, false, nil)
+	check, err := r.Check(context.Background(), plugin.CheckRequest{
+		URN:  urn,
+		Olds: olds,
+		News: news,
+	})
 	assert.Error(t, err)
-	assert.Empty(t, failures)
-	assert.Nil(t, inputs)
+	assert.Empty(t, check.Failures)
+	assert.Nil(t, check.Properties)
 }
 
 func TestCRUDBadVersionNotString(t *testing.T) {
@@ -772,8 +753,7 @@ func TestCRUDBadVersionNotString(t *testing.T) {
 	}
 	host := newPluginHost(t, loaders)
 
-	r, err := NewRegistry(host, []*resource.State{}, false, nil)
-	assert.NoError(t, err)
+	r := NewRegistry(host, false, nil)
 	assert.NotNil(t, r)
 
 	typ := MakeProviderType("pkgA")
@@ -781,11 +761,15 @@ func TestCRUDBadVersionNotString(t *testing.T) {
 	olds, news := resource.PropertyMap{}, resource.PropertyMap{"version": resource.NewBoolProperty(true)}
 
 	// Check
-	inputs, failures, err := r.Check(urn, olds, news, false, nil)
+	check, err := r.Check(context.Background(), plugin.CheckRequest{
+		URN:  urn,
+		Olds: olds,
+		News: news,
+	})
 	assert.NoError(t, err)
-	assert.Len(t, failures, 1)
-	assert.Equal(t, "version", string(failures[0].Property))
-	assert.Nil(t, inputs)
+	assert.Len(t, check.Failures, 1)
+	assert.Equal(t, "version", string(check.Failures[0].Property))
+	assert.Nil(t, check.Properties)
 }
 
 func TestCRUDBadVersion(t *testing.T) {
@@ -796,8 +780,7 @@ func TestCRUDBadVersion(t *testing.T) {
 	}
 	host := newPluginHost(t, loaders)
 
-	r, err := NewRegistry(host, []*resource.State{}, false, nil)
-	assert.NoError(t, err)
+	r := NewRegistry(host, false, nil)
 	assert.NotNil(t, r)
 
 	typ := MakeProviderType("pkgA")
@@ -805,9 +788,205 @@ func TestCRUDBadVersion(t *testing.T) {
 	olds, news := resource.PropertyMap{}, resource.PropertyMap{"version": resource.NewStringProperty("foo")}
 
 	// Check
-	inputs, failures, err := r.Check(urn, olds, news, false, nil)
+	check, err := r.Check(context.Background(), plugin.CheckRequest{
+		URN:  urn,
+		Olds: olds,
+		News: news,
+	})
 	assert.NoError(t, err)
-	assert.Len(t, failures, 1)
-	assert.Equal(t, "version", string(failures[0].Property))
-	assert.Nil(t, inputs)
+	assert.Len(t, check.Failures, 1)
+	assert.Equal(t, "version", string(check.Failures[0].Property))
+	assert.Nil(t, check.Properties)
+}
+
+//nolint:paralleltest
+func TestLoadProvider_missingError(t *testing.T) {
+	var count int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	version := semver.MustParse("1.2.3")
+	loader := newLoader(t, "myplugin", "1.2.3",
+		func(p tokens.Package, v semver.Version) (plugin.Provider, error) {
+			return nil, workspace.NewMissingError(
+				apitype.ResourcePlugin, "myplugin", &version, false /* ambient */)
+		})
+	host := newPluginHost(t, []*providerLoader{loader})
+
+	t.Run("PULUMI_DISABLE_AUTOMATIC_PLUGIN_ACQUISITION=true", func(t *testing.T) {
+		t.Setenv("PULUMI_DISABLE_AUTOMATIC_PLUGIN_ACQUISITION", "true")
+
+		_, err := loadProvider(
+			context.Background(),
+			"myplugin", &version, srv.URL,
+			nil, host, nil /* builtins */)
+		assert.ErrorContains(t, err,
+			"no resource plugin 'pulumi-resource-myplugin' found in the workspace at version v1.2.3")
+		assert.Equal(t, 0, count)
+	})
+
+	t.Run("PULUMI_DISABLE_AUTOMATIC_PLUGIN_ACQUISITION=false", func(t *testing.T) {
+		t.Setenv("PULUMI_DISABLE_AUTOMATIC_PLUGIN_ACQUISITION", "false")
+
+		_, err := loadProvider(
+			context.Background(),
+			"myplugin", &version, srv.URL,
+			nil, host, nil /* builtins */)
+		assert.ErrorContains(t, err,
+			"Could not automatically download and install resource plugin 'pulumi-resource-myplugin' at version v1.2.3")
+		assert.ErrorContains(t, err,
+			fmt.Sprintf("install the plugin using `pulumi plugin install resource myplugin v1.2.3 --server %s`", srv.URL))
+		assert.Equal(t, 5, count)
+	})
+}
+
+func TestConcurrentRegistryUsage(t *testing.T) {
+	// Regression test for https://github.com/pulumi/pulumi/issues/13491, make sure we can use registry in
+	// parallel.
+
+	t.Parallel()
+
+	loaders := []*providerLoader{
+		newSimpleLoader(t, "pkgA", "1.0.0", nil),
+	}
+	host := newPluginHost(t, loaders)
+
+	r := NewRegistry(host, false, nil)
+	assert.NotNil(t, r)
+
+	// We're going to create a few thousand providers in parallel, registering a load of aliases for each of
+	// them.
+	var wg sync.WaitGroup
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			typ := MakeProviderType("pkgA")
+			providerURN := resource.NewURN("test", "test", "", typ, fmt.Sprintf("p%d", i))
+
+			for j := 0; j < 1000; j++ {
+				aliasURN := resource.NewURN("test", "test", "", typ, fmt.Sprintf("p%d_%d", i, j))
+				r.RegisterAlias(providerURN, aliasURN)
+			}
+
+			// Now check that we can get the provider back.
+			olds, news := resource.PropertyMap{}, resource.PropertyMap{"version": resource.NewBoolProperty(true)}
+
+			// Check
+			check, err := r.Check(context.Background(), plugin.CheckRequest{
+				URN:  providerURN,
+				Olds: olds,
+				News: news,
+			})
+			assert.NoError(t, err)
+			assert.Len(t, check.Failures, 1)
+			assert.Equal(t, "version", string(check.Failures[0].Property))
+			assert.Nil(t, check.Properties)
+		}(i)
+	}
+}
+
+func TestRegistry(t *testing.T) {
+	t.Parallel()
+	t.Run("Close", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		assert.Nil(t, r.Close())
+		// Ensure idempotent.
+		assert.Nil(t, r.Close())
+	})
+	t.Run("Pkg", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		assert.Equal(t, tokens.Package("pulumi"), r.Pkg())
+	})
+	t.Run("GetSchema", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		assert.Panics(t, func() {
+			_, _ = r.GetSchema(context.Background(), plugin.GetSchemaRequest{})
+		})
+	})
+	t.Run("GetMapping", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		assert.Panics(t, func() {
+			_, _ = r.GetMapping(context.Background(), plugin.GetMappingRequest{})
+		})
+	})
+	t.Run("GetMappings", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		assert.Panics(t, func() {
+			_, _ = r.GetMappings(context.Background(), plugin.GetMappingsRequest{})
+		})
+	})
+	t.Run("CheckConfig", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		assert.Panics(t, func() {
+			_, _ = r.CheckConfig(context.Background(), plugin.CheckConfigRequest{AllowUnknowns: true})
+		})
+	})
+	t.Run("DiffConfig", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		assert.Panics(t, func() {
+			_, _ = r.DiffConfig(context.Background(), plugin.DiffConfigRequest{AllowUnknowns: true})
+		})
+	})
+	t.Run("Configure", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		assert.Panics(t, func() {
+			_, _ = r.Configure(context.Background(), plugin.ConfigureRequest{})
+		})
+	})
+	t.Run("Read", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		_, err := r.Read(context.Background(), plugin.ReadRequest{})
+		assert.ErrorContains(t, err, "provider resources may not be read")
+	})
+	t.Run("Construct", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		_, err := r.Construct(context.Background(), plugin.ConstructRequest{})
+		assert.ErrorContains(t, err, "provider resources may not be constructed")
+	})
+	t.Run("Invoke", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		assert.Panics(t, func() {
+			_, _ = r.Invoke(context.Background(), plugin.InvokeRequest{})
+		})
+	})
+	t.Run("StreamInvoke", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		_, err := r.StreamInvoke(context.Background(), plugin.StreamInvokeRequest{})
+		assert.ErrorContains(t, err, "the provider registry does not implement streaming invokes")
+	})
+	t.Run("Call", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		assert.Panics(t, func() {
+			_, _ = r.Call(context.Background(), plugin.CallRequest{})
+		})
+	})
+	t.Run("GetPluginInfo", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		_, err := r.GetPluginInfo(context.Background())
+		assert.ErrorContains(t, err, "the provider registry does not report plugin info")
+	})
+	t.Run("SignalCancellation", func(t *testing.T) {
+		t.Parallel()
+		r := &Registry{}
+		assert.Nil(t, r.SignalCancellation(context.Background()))
+	})
 }

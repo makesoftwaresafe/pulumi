@@ -42,10 +42,16 @@ func NewTupleType(elementTypes ...Type) Type {
 	return &TupleType{ElementTypes: elementTypes}
 }
 
-func (t *TupleType) Pretty() pretty.Formatter {
+func (t *TupleType) pretty(seenFormatters map[Type]pretty.Formatter) pretty.Formatter {
 	elements := make([]pretty.Formatter, len(t.ElementTypes))
 	for i, el := range t.ElementTypes {
-		elements[i] = el.Pretty()
+		formatter, ok := seenFormatters[el]
+		if ok {
+			elements[i] = formatter
+		} else {
+			seenFormatters[el] = el.pretty(seenFormatters)
+			elements[i] = seenFormatters[el]
+		}
 	}
 	return &pretty.Wrap{
 		Prefix: "(",
@@ -56,6 +62,11 @@ func (t *TupleType) Pretty() pretty.Formatter {
 		},
 		Postfix: ")",
 	}
+}
+
+func (t *TupleType) Pretty() pretty.Formatter {
+	seenFormatters := map[Type]pretty.Formatter{}
+	return t.pretty(seenFormatters)
 }
 
 // SyntaxNode returns the syntax node for the type. This is always syntax.None.
@@ -141,12 +152,12 @@ func (u *tupleElementUnifier) unify(t *TupleType) {
 	if !u.any {
 		u.elementTypes, u.any, u.conversionKind = append([]Type(nil), t.ElementTypes...), true, SafeConversion
 	} else {
-		min := len(u.elementTypes)
-		if l := len(t.ElementTypes); l < min {
-			min = l
+		minimum := len(u.elementTypes)
+		if l := len(t.ElementTypes); l < minimum {
+			minimum = l
 		}
 
-		for i := 0; i < min; i++ {
+		for i := 0; i < minimum; i++ {
 			element, ck := u.elementTypes[i].unify(t.ElementTypes[i])
 			if ck < u.conversionKind {
 				u.conversionKind = ck
@@ -155,11 +166,11 @@ func (u *tupleElementUnifier) unify(t *TupleType) {
 		}
 
 		if len(u.elementTypes) > len(t.ElementTypes) {
-			for i := min; i < len(u.elementTypes); i++ {
+			for i := minimum; i < len(u.elementTypes); i++ {
 				u.elementTypes[i] = NewOptionalType(u.elementTypes[i])
 			}
 		} else {
-			for _, t := range t.ElementTypes[min:] {
+			for _, t := range t.ElementTypes[minimum:] {
 				u.elementTypes = append(u.elementTypes, NewOptionalType(t))
 			}
 		}

@@ -17,6 +17,7 @@ package backend
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,20 +29,18 @@ import (
 
 	"github.com/pulumi/pulumi/pkg/v3/backend/display"
 	"github.com/pulumi/pulumi/pkg/v3/operations"
-	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
 )
 
 // Watch watches the project's working directory for changes and automatically updates the active
 // stack.
-func Watch(ctx context.Context, secretsProvider secrets.Provider, b Backend, stack Stack, op UpdateOperation,
-	apply Applier, paths []string) result.Result {
-
+func Watch(ctx context.Context, b Backend, stack Stack, op UpdateOperation,
+	apply Applier, paths []string,
+) error {
 	opts := ApplierOptions{
 		DryRun:   false,
 		ShowLink: false,
@@ -52,7 +51,7 @@ func Watch(ctx context.Context, secretsProvider secrets.Provider, b Backend, sta
 	go func() {
 		shown := map[operations.LogEntry]bool{}
 		for {
-			logs, err := b.GetLogs(ctx, secretsProvider, stack, op.StackConfiguration, operations.LogQuery{
+			logs, err := b.GetLogs(ctx, op.SecretsProvider, stack, op.StackConfiguration, operations.LogQuery{
 				StartTime: &startTime,
 			})
 			if err != nil {
@@ -64,7 +63,7 @@ func Watch(ctx context.Context, secretsProvider secrets.Provider, b Backend, sta
 					eventTime := time.Unix(0, logEntry.Timestamp*1000000)
 
 					message := strings.TrimRight(logEntry.Message, "\n")
-					display.PrintfWithWatchPrefix(eventTime, logEntry.ID, "%s\n", message)
+					display.WatchPrefixPrintf(eventTime, logEntry.ID, "%s\n", message)
 
 					shown[logEntry] = true
 				}
@@ -76,7 +75,7 @@ func Watch(ctx context.Context, secretsProvider secrets.Provider, b Backend, sta
 	// Provided paths can be both relative and absolute.
 	events, stop, err := watchPaths(op.Root, paths)
 	if err != nil {
-		return result.FromError(err)
+		return err
 	}
 	defer stop()
 
@@ -84,20 +83,20 @@ func Watch(ctx context.Context, secretsProvider secrets.Provider, b Backend, sta
 		colors.SpecHeadline+"Watching (%s):"+colors.Reset+"\n"), stack.Ref())
 
 	for range events {
-		display.PrintfWithWatchPrefix(time.Now(), "",
+		display.WatchPrefixPrintf(time.Now(), "", "%s",
 			op.Opts.Display.Color.Colorize(colors.SpecImportant+"Updating..."+colors.Reset+"\n"))
 
 		// Perform the update operation
-		_, _, res := apply(ctx, apitype.UpdateUpdate, stack, op, opts, nil)
-		if res != nil {
-			logging.V(5).Infof("watch update failed: %v", res.Error())
-			if res.Error() == context.Canceled {
-				return res
+		_, _, err = apply(ctx, apitype.UpdateUpdate, stack, op, opts, nil)
+		if err != nil {
+			logging.V(5).Infof("watch update failed: %v", err)
+			if err == context.Canceled {
+				return err
 			}
-			display.PrintfWithWatchPrefix(time.Now(), "",
+			display.WatchPrefixPrintf(time.Now(), "", "%s",
 				op.Opts.Display.Color.Colorize(colors.SpecImportant+"Update failed."+colors.Reset+"\n"))
 		} else {
-			display.PrintfWithWatchPrefix(time.Now(), "",
+			display.WatchPrefixPrintf(time.Now(), "", "%s",
 				op.Opts.Display.Color.Colorize(colors.SpecImportant+"Update complete."+colors.Reset+"\n"))
 		}
 	}
@@ -108,8 +107,7 @@ func Watch(ctx context.Context, secretsProvider secrets.Provider, b Backend, sta
 func watchPaths(root string, paths []string) (chan string, func(), error) {
 	args := []string{"--origin", root}
 	for _, p := range paths {
-
-		watchPath := ""
+		var watchPath string
 		if path.IsAbs(p) {
 			watchPath = p
 		} else {
@@ -166,7 +164,7 @@ func getWatchUtil() (string, error) {
 			// Let's see if the file is executable. On Windows, os.Stat() returns a mode of "-rw-rw-rw" so on
 			// on windows we just trust the fact that the .exe can actually be launched.
 			if stat, err := os.Stat(candidate); err == nil {
-				if stat.Mode()&0100 != 0 || runtime.GOOS == windowsGOOS {
+				if stat.Mode()&0o100 != 0 || runtime.GOOS == windowsGOOS {
 					return candidate, nil
 				}
 				return "", fmt.Errorf("Could not locate an executable pulumi-watch, found %v without execute bit", fullPath)
@@ -174,7 +172,7 @@ func getWatchUtil() (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("Could not locate pulumi-watch binary")
+	return "", errors.New("Could not locate pulumi-watch binary")
 }
 
 func stdoutToChannel(scanner *bufio.Scanner, out chan string) {

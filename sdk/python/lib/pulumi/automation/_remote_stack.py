@@ -50,7 +50,7 @@ class RemoteStack:
     ) -> UpResult:
         """
         Creates or updates the resources in a stack by executing the program in the Workspace.
-        https://www.pulumi.com/docs/reference/cli/pulumi_up/
+        https://www.pulumi.com/docs/cli/commands/pulumi_up/
 
         :param on_output: A function to process the stdout stream.
         :param on_event: A function to process structured events from the Pulumi event stream.
@@ -65,7 +65,7 @@ class RemoteStack:
     ) -> PreviewResult:
         """
         Performs a dry-run update to a stack, returning pending changes.
-        https://www.pulumi.com/docs/reference/cli/pulumi_preview/
+        https://www.pulumi.com/docs/cli/commands/pulumi_preview/
 
         :param on_output: A function to process the stdout stream.
         :param on_event: A function to process structured events from the Pulumi event stream.
@@ -133,7 +133,6 @@ class RemoteStack:
         Cancel stops a stack's currently running update. It returns an error if no update is currently running.
         Note that this operation is _very dangerous_, and may leave the stack in an inconsistent state
         if a resource operation was pending when the update was canceled.
-        This command is not supported for local backends.
         """
         self.__stack.cancel()
 

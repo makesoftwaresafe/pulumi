@@ -1,4 +1,4 @@
-// Copyright 2016-2021, Pulumi Corporation.
+// Copyright 2016-2024, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,14 +24,13 @@ import (
 func TestEnvOverrideGetCommandResults(t *testing.T) {
 	t.Parallel()
 
-	e := NewGoEnvironment(t)
+	e := NewEnvironment(t)
 	checkDebug := func(expect string) {
 		stdout, stderr, err := e.GetCommandResults("bash", "-c", "echo $PULUMI_DEBUG_COMMANDS")
 		stdout = strings.TrimSuffix(stdout, "\n")
 		assert.NoError(t, err)
 		assert.Empty(t, stderr)
 		assert.Equal(t, expect, stdout)
-
 	}
 	// We default PULUMI_DEBUG_COMMANDS to true
 	checkDebug("true")

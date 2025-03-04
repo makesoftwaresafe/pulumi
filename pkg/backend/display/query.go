@@ -28,15 +28,15 @@ import (
 
 // ShowQueryEvents displays query events on the CLI.
 func ShowQueryEvents(op string, events <-chan engine.Event,
-	done chan<- bool, opts Options) {
-
+	done chan<- bool, opts Options,
+) {
 	prefix := fmt.Sprintf("%s%s...", cmdutil.EmojiOr("✨ ", "@ "), op)
 
 	var spinner cmdutil.Spinner
 	var ticker *time.Ticker
 
 	if opts.IsInteractive {
-		spinner, ticker = cmdutil.NewSpinnerAndTicker(prefix, nil, opts.Color, 8 /*timesPerSecond*/)
+		spinner, ticker = cmdutil.NewSpinnerAndTicker(prefix, nil, opts.Color, 8 /*timesPerSecond*/, opts.SuppressProgress)
 	} else {
 		spinner = &nopSpinner{}
 		ticker = time.NewTicker(math.MaxInt64)
@@ -87,10 +87,19 @@ func renderQueryEvent(event engine.Event, opts Options) string {
 	case engine.DiagEvent:
 		return renderQueryDiagEvent(event.Payload().(engine.DiagEventPayload), opts)
 
+	case engine.StartDebuggingEvent:
+		return ""
+
 	case engine.PreludeEvent, engine.SummaryEvent, engine.ResourceOperationFailed,
 		engine.ResourceOutputsEvent, engine.ResourcePreEvent:
 
 		contract.Failf("query mode does not support resource operations")
+		return ""
+
+	case engine.PolicyLoadEvent, engine.PolicyViolationEvent, engine.PolicyRemediationEvent:
+		return ""
+
+	case engine.ProgressEvent:
 		return ""
 
 	default:

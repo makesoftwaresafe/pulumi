@@ -135,7 +135,7 @@ func TestWriter_Terminal(t *testing.T) {
 		outBytes, err := io.ReadAll(&server.stdout)
 		assert.NoError(t, err)
 		// echo adds an extra \n at the end, and line discipline will cause \n to come back as \r\n
-		expected := strings.Replace(text+"\n", "\n", "\r\n", -1)
+		expected := strings.ReplaceAll(text+"\n", "\n", "\r\n")
 		assert.Equal(t, []byte(expected), outBytes)
 
 		errBytes, err := io.ReadAll(&server.stderr)
@@ -177,6 +177,7 @@ func TestWriter_IsPTY(t *testing.T) {
 		// These will be os.Files if a pty
 		file, ok := stdout.(*os.File)
 		assert.True(t, ok, "stdout was not a File")
+		//nolint:gosec
 		assert.True(t, term.IsTerminal(int(file.Fd())), "stdout was not a terminal")
 	}
 

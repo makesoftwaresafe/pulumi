@@ -47,8 +47,8 @@ func (t *SetType) Traverse(traverser hcl.Traverser) (Traversable, hcl.Diagnostic
 // Equals returns true if this type has the same identity as the given type.
 func (t *SetType) Equals(other Type) bool {
 	return t.equals(other, nil)
-
 }
+
 func (t *SetType) equals(other Type, seen map[Type]struct{}) bool {
 	if t == other {
 		return true
@@ -99,12 +99,24 @@ func (t *SetType) conversionFrom(src Type, unifying bool, seen map[Type]struct{}
 	})
 }
 
-func (t *SetType) Pretty() pretty.Formatter {
+func (t *SetType) pretty(seenFormatters map[Type]pretty.Formatter) pretty.Formatter {
+	var formatter pretty.Formatter
+	if seenFormatter, ok := seenFormatters[t.ElementType]; ok {
+		formatter = seenFormatter
+	} else {
+		formatter = t.ElementType.pretty(seenFormatters)
+	}
+
 	return &pretty.Wrap{
 		Prefix:  "set(",
-		Value:   t.ElementType.Pretty(),
 		Postfix: ")",
+		Value:   formatter,
 	}
+}
+
+func (t *SetType) Pretty() pretty.Formatter {
+	seenFormatters := map[Type]pretty.Formatter{}
+	return t.pretty(seenFormatters)
 }
 
 func (t *SetType) String() string {

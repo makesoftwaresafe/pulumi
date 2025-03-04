@@ -25,8 +25,10 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
-const colorLeft = "<{%"
-const colorRight = "%}>"
+const (
+	colorLeft  = "<{%"
+	colorRight = "%}>"
+)
 
 type Color = string
 
@@ -130,6 +132,8 @@ func writeDirective(w io.StringWriter, c Colorization, directive Color) {
 		writeCodes(w, "48", "5", "4")
 	case Black: // command("fg 0") // Only use with background colors.
 		writeCodes(w, "38", "5", "0")
+	case BrightBlack: // command("fg 8")
+		writeCodes(w, "38", "5", "8")
 	default:
 		contract.Failf("Unrecognized color code: %q", directive)
 	}
@@ -224,7 +228,7 @@ func measureText(s string) int {
 	i := iterator{s}
 	var text, directive string
 	for i.next(&text, &directive) {
-		width += uniseg.GraphemeClusterCount(text)
+		width += uniseg.StringWidth(text)
 	}
 
 	return width
@@ -234,9 +238,9 @@ func clampString(s string, maxWidth int) string {
 	width, end := 0, 0
 
 	graphemes := uniseg.NewGraphemes(s)
-	for width < maxWidth && graphemes.Next() {
+	for graphemes.Next() && graphemes.Width() <= maxWidth-width {
 		_, end = graphemes.Positions()
-		width++
+		width += graphemes.Width()
 	}
 
 	return s[:end]
@@ -245,7 +249,7 @@ func clampString(s string, maxWidth int) string {
 // Highlight takes an input string, a sequence of commands, and replaces all occurrences of that string with
 // a "highlighted" version surrounded by those commands and a final reset afterwards.
 func Highlight(s, text, commands string) string {
-	return strings.Replace(s, text, commands+text+Reset, -1)
+	return strings.ReplaceAll(s, text, commands+text+Reset)
 }
 
 var (
@@ -278,7 +282,7 @@ var (
 
 	Black = command("fg 0") // Only use with background colors.
 	// White         = command("fg 7")
-	// BrightBlack   = command("fg 8")
+	BrightBlack = command("fg 8")
 	// BrightYellow  = command("fg 11")
 	// BrightWhite   = command("fg 15")
 )

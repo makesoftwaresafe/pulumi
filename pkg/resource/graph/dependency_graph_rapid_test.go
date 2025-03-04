@@ -63,7 +63,7 @@ var hasDependency R = func(res, dependency *resource.State) bool {
 	return false
 }
 
-var expectedDependenciesOf R = union(isParent, hasProvider, hasDependency)
+var expectedDependenciesOf = union(isParent, hasProvider, hasDependency)
 
 // Verify `DependneciesOf` against `expectedDependenciesOf`.
 func TestRapidDependenciesOf(t *testing.T) {
@@ -75,21 +75,21 @@ func TestRapidDependenciesOf(t *testing.T) {
 			aD := dg.DependenciesOf(a)
 			for _, b := range universe {
 				if isParent(a, b) {
-					assert.Truef(t, aD[b],
+					assert.Truef(t, aD.Contains(b),
 						"DependenciesOf(%v) is missing a parent %v",
 						a.URN, b.URN)
 				}
 				if hasProvider(a, b) {
-					assert.Truef(t, aD[b],
+					assert.Truef(t, aD.Contains(b),
 						"DependenciesOf(%v) is missing a provider %v",
 						a.URN, b.URN)
 				}
 				if hasDependency(a, b) {
-					assert.Truef(t, aD[b],
+					assert.Truef(t, aD.Contains(b),
 						"DependenciesOf(%v) is missing a dependecy %v",
 						a.URN, b.URN)
 				}
-				if aD[b] {
+				if aD.Contains(b) {
 					assert.True(t, expectedDependenciesOf(a, b),
 						"DependenciesOf(%v) includes an unexpected %v",
 						a.URN, b.URN)
@@ -110,7 +110,7 @@ func TestRapidDependenciesOfAntisymmetric(t *testing.T) {
 			aD := dg.DependenciesOf(a)
 			for _, b := range universe {
 				bD := dg.DependenciesOf(b)
-				assert.Falsef(t, aD[b] && bD[a],
+				assert.Falsef(t, aD.Contains(b) && bD.Contains(a),
 					"DependenciesOf symmetric over (%v, %v)", a.URN, b.URN)
 			}
 		}
@@ -227,7 +227,7 @@ func TestRapidTransitiveDependenciesOf(t *testing.T) {
 			for _, b := range universe {
 				assert.Equalf(t,
 					expectedInTDepsOf(a, b),
-					tda[b],
+					tda.Contains(b),
 					"Mismatch on a=%v, b=%b",
 					a.URN,
 					b.URN)
@@ -254,11 +254,11 @@ func TestRapidTransitiveDependenciesOf(t *testing.T) {
 //
 // - Support Component resources
 // - Support non-nil r.Provider references
-func resourceStateSliceGenerator() *rapid.Generator {
+func resourceStateSliceGenerator() *rapid.Generator[[]*resource.State] {
 	urnGen := rapid.StringMatching(`urn:pulumi:a::b::c:d:e::[abcd][123]`)
 
 	stateGen := rapid.Custom(func(t *rapid.T) *resource.State {
-		urn := urnGen.Draw(t, "URN").(string)
+		urn := urnGen.Draw(t, "URN")
 		return &resource.State{
 			Custom: true,
 			URN:    resource.URN(urn),
@@ -270,14 +270,14 @@ func resourceStateSliceGenerator() *rapid.Generator {
 	statesGen := rapid.SliceOfDistinct(stateGen, getUrn)
 
 	return rapid.Custom(func(t *rapid.T) []*resource.State {
-		states := statesGen.Draw(t, "states").([]*resource.State)
+		states := statesGen.Draw(t, "states")
 
 		randInt := rapid.IntRange(-len(states), len(states))
 
 		for i, r := range states {
 			// Any resource at index `i` may want to declare `j < i` as parent.
 			// Sample negative `j` to means "no parent".
-			j := randInt.Draw(t, fmt.Sprintf("j%d", i)).(int)
+			j := randInt.Draw(t, fmt.Sprintf("j%d", i))
 			if j >= 0 && j < i {
 				r.Parent = states[j].URN
 			}
@@ -285,7 +285,7 @@ func resourceStateSliceGenerator() *rapid.Generator {
 			deps := rapid.SliceOfDistinct(
 				randInt,
 				func(i int) int { return i },
-			).Draw(t, fmt.Sprintf("deps%d", i)).([]int)
+			).Draw(t, fmt.Sprintf("deps%d", i))
 			for _, dep := range deps {
 				if dep >= 0 && dep < i {
 					r.Dependencies = append(r.Dependencies, states[dep].URN)
@@ -391,7 +391,7 @@ func showStates(sts []*resource.State) string {
 func graphCheck(t *testing.T, check func(*rapid.T, []*resource.State)) {
 	rss := resourceStateSliceGenerator()
 	rapid.Check(t, func(t *rapid.T) {
-		universe := rss.Draw(t, "universe").([]*resource.State)
+		universe := rss.Draw(t, "universe")
 		t.Logf("Checking universe: %s", showStates(universe))
 		check(t, universe)
 	})

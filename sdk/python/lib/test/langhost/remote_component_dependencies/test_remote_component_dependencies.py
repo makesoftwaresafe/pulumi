@@ -41,8 +41,9 @@ class RemoteComponentDependenciesTest(LanghostTest):
         _version,
         _import,
         _replace_on_changes,
+        _providers,
+        source_position,
     ):
-
         if name == "resA":
             self.assertEqual(len(_dependencies), 0, "resA dependencies")
         elif name == "resB":

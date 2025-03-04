@@ -31,6 +31,7 @@ class JobKind(str, Enum):
     INTEGRATION_TEST = "integration-test"
     ACCEPTANCE_TEST = "acceptance-test"
     UNIT_TEST = "unit-test"
+    PERFORMANCE_TEST = "performance-test"
     ALL_TEST = "all-test"
 
 
@@ -50,7 +51,6 @@ class PartitionPackage:
 
 
 INTEGRATION_TEST_PACKAGES = {
-    "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi",
     "github.com/pulumi/pulumi/pkg/v3/codegen/testing/utils",
     "github.com/pulumi/pulumi/pkg/v3/graph/dotconv",
     "github.com/pulumi/pulumi/pkg/v3/testing/integration",
@@ -64,13 +64,42 @@ INTEGRATION_TEST_PACKAGES = {
     # And the entirety of the 'tests' module
 }
 
+PERFORMANCE_TEST_PACKAGES = {
+    "github.com/pulumi/pulumi/tests/performance",
+}
 
 def is_unit_test(pkg: str) -> bool:
     """Checks if the package is a unit test"""
     return not (
-        pkg.startswith("github.com/pulumi/pulumi/tests")
+        pkg.startswith("github.com/pulumi/pulumi/pkg/v3/cmd/pulumi")
+        or pkg.startswith("github.com/pulumi/pulumi/tests")
         or pkg in INTEGRATION_TEST_PACKAGES
+        or pkg in PERFORMANCE_TEST_PACKAGES
     )
+
+def is_performance_test(pkg: str) -> bool:
+    return pkg in PERFORMANCE_TEST_PACKAGES
+
+# Keep this in sync with filters defined in .github/workflows/on-pr.yml.
+CODEGEN_TEST_PACKAGES = {
+    "github.com/pulumi/pulumi/pkg/v3/codegen/docs",
+    "github.com/pulumi/pulumi/pkg/v3/codegen/dotnet",
+    "github.com/pulumi/pulumi/pkg/v3/codegen/go",
+    "github.com/pulumi/pulumi/pkg/v3/codegen/nodejs",
+    "github.com/pulumi/pulumi/pkg/v3/codegen/python",
+}
+
+def is_codegen_test(pkg: str) -> bool:
+    """Checks if a package is a per-language codegen test"""
+    if pkg in CODEGEN_TEST_PACKAGES:
+        return True
+
+    for codegen_pkg in CODEGEN_TEST_PACKAGES:
+        if pkg.startswith(codegen_pkg + "/"):
+            return True
+
+    return False
+
 
 class MakefileTest(TypedDict):
     name: str
@@ -80,31 +109,53 @@ class MakefileTest(TypedDict):
 MAKEFILE_INTEGRATION_TESTS: List[MakefileTest] = [
     {"name": "sdk/nodejs test_auto", "run": "cd sdk/nodejs && ../../scripts/retry make test_auto", "eta": 3},
     {"name": "sdk/nodejs unit_tests", "run": "cd sdk/nodejs && ../../scripts/retry make unit_tests", "eta": 4},
+    {"name": "sdk/nodejs test_integration", "run": "cd sdk/nodejs && ../../scripts/retry make test_integration", "eta": 3},
     {"name": "sdk/python test_auto", "run": "cd sdk/python && ../../scripts/retry make test_auto", "eta": 6},
     {"name": "sdk/python test_fast", "run": "cd sdk/python && ../../scripts/retry make test_fast", "eta": 3},
+]
+
+MAKEFILE_ACCEPTANCE_TESTS: List[MakefileTest] = [
+    {"name": "sdk/nodejs test_integration", "run": "cd sdk/nodejs && ../../scripts/retry make test_integration", "eta": 3},
 ]
 
 MAKEFILE_UNIT_TESTS: List[MakefileTest] = [
     {"name": "sdk/nodejs sxs_tests", "run": "cd sdk/nodejs && ../../scripts/retry make sxs_tests", "eta": 3},
 ]
 
-ALL_PLATFORMS = ["ubuntu-latest", "windows-latest", "macos-latest"]
+MAKEFILE_PERFORMANCE_TESTS: List[MakefileTest] = [
+    {"name": "performance tests", "run": "./scripts/retry make test_performance", "eta": 10},
+]
 
+ALL_PLATFORMS = ["ubuntu-22.04", "windows-latest", "macos-latest"]
+
+
+# When updating the minumum and current versions, consider also updating the
+# versions in the the pulumi-docker-containers repo by updating the file
+# https://github.com/pulumi/pulumi-docker-containers/blob/main/.github/scripts/matrix/versions.py
 
 MINIMUM_SUPPORTED_VERSION_SET = {
     "name": "minimum",
     "dotnet": "6",
-    "go": "1.19.x",
-    "nodejs": "14.x",
+    "go": "1.22.x",
+    "nodejs": "18.x",
+    # When updating the minimum Python version here, also update `pyproject.toml`, including the
+    # `mypy` and `ruff` sections.
     "python": "3.9.x",
+}
+
+ALL_VERSION_SET = {
+    "dotnet": ["6", "8", "9"],
+    "go": ["1.22.x", "1.23.x"],
+    "nodejs": ["18.x", "20.x", "22.x", "23.x"],
+    "python": ["3.9.x", "3.10.x", "3.11.x", "3.12.x", "3.13.x"],
 }
 
 CURRENT_VERSION_SET = {
     "name": "current",
-    "dotnet": "7",
-    "go": "1.20.x",
-    "nodejs": "19.x",
-    "python": "3.10.x",
+    "dotnet": "9",
+    "go": "1.23.x",
+    "nodejs": "23.x",
+    "python": "3.13.x",
 }
 
 
@@ -160,7 +211,7 @@ def run_list_tests(pkg_dir: str, tags: List[str]) -> List[str]:
             text=True,
         )
     except sp.CalledProcessError as err:
-        message=f"Failed to list tests in package dir '{pkg_dir}', usually this implies a Go compilation error. Check that `make lint` succeeds."
+        message=f"Failed to list tests in package dir '{pkg_dir}', usually this implies a Go compilation error. Check that `make lint` succeeds. Also check that `make tidy` has been run."
         print(f"::error {message}", file=sys.stderr)
         raise Exception(message) from err
 
@@ -348,6 +399,7 @@ def get_matrix(
     platforms: List[str],
     version_sets: List[VersionSet],
     fast: bool = False,
+    codegen_tests: bool = False,
 ) -> Matrix:
     """Compute a job matrix"""
     if kind == JobKind.INTEGRATION_TEST:
@@ -355,7 +407,9 @@ def get_matrix(
     elif kind == JobKind.UNIT_TEST:
         makefile_tests = MAKEFILE_UNIT_TESTS
     elif kind == JobKind.ACCEPTANCE_TEST:
-        makefile_tests = []
+        makefile_tests = MAKEFILE_ACCEPTANCE_TESTS
+    elif kind == JobKind.PERFORMANCE_TEST:
+        makefile_tests = MAKEFILE_PERFORMANCE_TESTS
     elif kind == JobKind.ALL_TEST:
         makefile_tests = MAKEFILE_INTEGRATION_TESTS + MAKEFILE_UNIT_TESTS
     else:
@@ -374,9 +428,11 @@ def get_matrix(
     for item in partition_modules:
         go_packages = run_list_packages(item.module_dir, tags)
         go_packages = set(go_packages) - partitioned_packages
+        if not codegen_tests:
+            go_packages = {pkg for pkg in go_packages if not is_codegen_test(pkg)}
 
         if kind == JobKind.INTEGRATION_TEST or kind == JobKind.ACCEPTANCE_TEST:
-            go_packages = {pkg for pkg in go_packages if not is_unit_test(pkg)}
+            go_packages = {pkg for pkg in go_packages if (not is_unit_test(pkg) and not is_performance_test(pkg))}
         elif kind == JobKind.UNIT_TEST:
             go_packages = {pkg for pkg in go_packages if is_unit_test(pkg)}
         elif kind == JobKind.ALL_TEST:
@@ -388,9 +444,6 @@ def get_matrix(
         pkg_tests = run_list_tests(item.package_dir, tags)
 
         test_suites += run_gotestsum_ci_matrix_single_package(item, pkg_tests, tags)
-
-    if kind == JobKind.ACCEPTANCE_TEST:
-        platforms = list(map(lambda p: "windows-8core-2022" if p == "windows-latest" else p, platforms))
 
     return {
         "test-suite": test_suites,
@@ -407,6 +460,16 @@ def get_version_sets(args: argparse.Namespace):
             version_sets.append(MINIMUM_SUPPORTED_VERSION_SET)
         elif named_version_set == "current":
             version_sets.append(CURRENT_VERSION_SET)
+        elif named_version_set == "all":
+            longest = len(ALL_VERSION_SET[max(ALL_VERSION_SET, key=lambda k: len(ALL_VERSION_SET[k]))])
+            for i in range(0, longest):
+                this_set = {**MINIMUM_SUPPORTED_VERSION_SET}
+                # Set the name.  This will be shown in the name of the CI job.
+                this_set["name"] = f"all-{i}"
+                for lang, versions in ALL_VERSION_SET.items():
+                    if len(versions) > i:
+                        this_set[lang] = versions[i]
+                version_sets.append(this_set)
         else:
             raise argparse.ArgumentError(argument=None, message=f"Unknown version set {named_version_set}")
 
@@ -453,6 +516,7 @@ def generate_matrix(args: argparse.Namespace):
         partition_modules=partition_modules,
         partition_packages=partition_packages,
         version_sets=version_sets,
+        codegen_tests=args.codegen_tests,
     )
 
     if not matrix["platform"] or not matrix["test-suite"] or not matrix["version-set"]:
@@ -469,6 +533,13 @@ def add_generate_matrix_args(parser: argparse.ArgumentParser):
         required=True,
         choices=[kind.value for kind in JobKind],
         help="Kind of output to generate",
+    )
+    parser.add_argument(
+        "--codegen-tests",
+        required=False,
+        default=True,
+        action=argparse.BooleanOptionalAction,  # adds --no-codegen-tests
+        help="Whether to include per-langauge codegen tests",
     )
     parser.add_argument(
         "--fast", action="store_true", default=False, help="Exclude slow tests"
@@ -514,7 +585,7 @@ def add_generate_matrix_args(parser: argparse.ArgumentParser):
         action="store",
         nargs="*",
         default=["minimum"],
-        choices=["minimum", "current"],
+        choices=["minimum", "current", "all"],
         help="Named set of versions to use. Defaults to minimum supported versions. Available sets: minimum, current",
     )
     default_versions = ",".join(

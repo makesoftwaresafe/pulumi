@@ -17,8 +17,8 @@ package pcl
 import (
 	"fmt"
 
-	"github.com/gedex/inflector"
 	"github.com/hashicorp/hcl/v2"
+	"github.com/pulumi/inflector"
 	"github.com/pulumi/pulumi/pkg/v3/codegen"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/model"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
@@ -34,6 +34,7 @@ type NameInfo interface {
 type applyRewriter struct {
 	nameInfo      NameInfo
 	applyPromises bool
+	skipToJSON    bool
 
 	activeContext applyRewriteContext
 	exprStack     []model.Expression
@@ -71,9 +72,13 @@ type observeContext struct {
 	nameCounts    map[string]int
 }
 
-func (r *applyRewriter) hasEventualTypes(t model.Type) bool {
+func HasEventualTypes(t model.Type) bool {
 	resolved := model.ResolveOutputs(t)
 	return resolved != t
+}
+
+func (r *applyRewriter) hasEventualTypes(t model.Type) bool {
+	return HasEventualTypes(t)
 }
 
 func (r *applyRewriter) hasEventualValues(x model.Expression) bool {
@@ -150,6 +155,11 @@ func (r *applyRewriter) inspectsEventualValues(x model.Expression) bool {
 	case *model.ForExpression:
 		return r.hasEventualElements(x.Collection)
 	case *model.FunctionCallExpression:
+		// special case toJSON function because we map it to pulumi.jsonStringify which accepts anything
+		// such that it doesn't have to rewrite its subexpressions to apply but can be used directly
+		if r.skipToJSON && x.Name == "toJSON" {
+			return false
+		}
 		_, isEventual := r.isEventualType(x.Signature.ReturnType)
 		if isEventual {
 			return true
@@ -189,6 +199,12 @@ func (r *applyRewriter) observesEventualValues(x model.Expression) bool {
 		_, collectionIsEventual := r.isEventualType(x.Collection.Type())
 		return collectionIsEventual
 	case *model.FunctionCallExpression:
+		// special case toJSON function because we map it to pulumi.jsonStringify which accepts anything
+		// such that it doesn't have to rewrite its subexpressions to apply but can be used directly
+		if r.skipToJSON && x.Name == "toJSON" {
+			return false
+		}
+
 		for i, arg := range x.Args {
 			if !r.isPromptArg(x.Signature.Parameters[i].Type, arg) {
 				return true
@@ -356,8 +372,8 @@ func (ctx *observeContext) disambiguateArgName(x model.Expression, bestName stri
 
 // rewriteApplyArg replaces a single expression with an apply parameter.
 func (ctx *observeContext) rewriteApplyArg(applyArg model.Expression, paramType model.Type, traversal hcl.Traversal,
-	parts []model.Traversable, isRoot bool) model.Expression {
-
+	parts []model.Traversable, isRoot bool,
+) model.Expression {
 	if len(traversal) == 0 && isRoot {
 		return applyArg
 	}
@@ -389,8 +405,8 @@ func (ctx *observeContext) rewriteApplyArg(applyArg model.Expression, paramType 
 // rewriteRelativeTraversalExpression replaces a single access to an ouptut-typed RelativeTraversalExpression with an
 // apply parameter.
 func (ctx *observeContext) rewriteRelativeTraversalExpression(expr *model.RelativeTraversalExpression,
-	isRoot bool) model.Expression {
-
+	isRoot bool,
+) model.Expression {
 	// If the access is not an output() or a promise(), return the node as-is.
 	paramType, isEventual := ctx.isEventualType(expr.Type())
 	if !isEventual {
@@ -422,8 +438,8 @@ func (ctx *observeContext) rewriteRelativeTraversalExpression(expr *model.Relati
 // rewriteScopeTraversalExpression replaces a single access to an ouptut-typed ScopeTraversalExpression with an apply
 // parameter.
 func (ctx *observeContext) rewriteScopeTraversalExpression(expr *model.ScopeTraversalExpression,
-	isRoot bool) model.Expression {
-
+	isRoot bool,
+) model.Expression {
 	// If the access is not an output() or a promise(), return the node as-is.
 	resolvedType, isEventual := ctx.isEventualType(expr.Type())
 	if !isEventual {
@@ -482,7 +498,7 @@ func (ctx *observeContext) rewriteScopeTraversalExpression(expr *model.ScopeTrav
 
 // rewriteRoot replaces the root node in a bound expression with a call to the __apply intrinsic if necessary.
 func (ctx *observeContext) rewriteRoot(expr model.Expression) model.Expression {
-	contract.Require(expr == ctx.root, "expr")
+	contract.Requiref(expr == ctx.root, "expr", "must be root expression")
 
 	if len(ctx.applyArgs) == 0 {
 		return expr
@@ -553,7 +569,7 @@ func (ctx *observeContext) PostVisit(expr model.Expression) (model.Expression, h
 
 	// TODO(pdg): arrays of outputs, for expressions, etc.
 	diagnostics := expr.Typecheck(false)
-	contract.Assert(len(diagnostics) == 0)
+	contract.Assertf(len(diagnostics) == 0, "error typechecking expression: %v", diagnostics)
 
 	if isIteratorExpr, _ := ctx.isIteratorExpr(expr); isIteratorExpr {
 		return expr, nil
@@ -644,9 +660,19 @@ func (ctx *inspectContext) PostVisit(expr model.Expression) (model.Expression, h
 // This form is amenable to code generation for targets that require that outputs are resolved before their values are
 // accessible (e.g. Pulumi's JS/TS libraries).
 func RewriteApplies(expr model.Expression, nameInfo NameInfo, applyPromises bool) (model.Expression, hcl.Diagnostics) {
+	return RewriteAppliesWithSkipToJSON(expr, nameInfo, applyPromises, false)
+}
+
+func RewriteAppliesWithSkipToJSON(
+	expr model.Expression,
+	nameInfo NameInfo,
+	applyPromises bool,
+	skipToJSON bool,
+) (model.Expression, hcl.Diagnostics) {
 	applyRewriter := &applyRewriter{
 		nameInfo:      nameInfo,
 		applyPromises: applyPromises,
+		skipToJSON:    skipToJSON,
 	}
 	applyRewriter.activeContext = &inspectContext{
 		applyRewriter: applyRewriter,

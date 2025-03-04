@@ -1,0 +1,7 @@
+name: l1-main
+runtime:
+  name: python
+  options:
+    typechecker: mypy
+    virtualenv: venv
+main: subdir

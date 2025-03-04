@@ -15,25 +15,111 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/testing/iotest"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/fsutil"
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestGetPlugin(t *testing.T) {
+func TestParseRunParams(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		desc    string
+		give    []string
+		want    runParams
+		wantErr string // non-empty if we expect an error
+	}{
+		{
+			desc: "no arguments",
+		},
+		{
+			desc: "no options",
+			give: []string{"localhost:1234"},
+			want: runParams{
+				engineAddress: "localhost:1234",
+			},
+		},
+		{
+			desc: "tracing",
+			give: []string{"-tracing", "foo.trace", "localhost:1234"},
+			want: runParams{
+				tracing:       "foo.trace",
+				engineAddress: "localhost:1234",
+			},
+		},
+		{
+			desc: "binary",
+			give: []string{"-binary", "foo", "localhost:1234"},
+			want: runParams{
+				engineAddress: "localhost:1234",
+			},
+		},
+		{
+			desc: "buildTarget",
+			give: []string{"-buildTarget", "foo", "localhost:1234"},
+			want: runParams{
+				engineAddress: "localhost:1234",
+			},
+		},
+		{
+			desc: "root",
+			give: []string{"-root", "path/to/root", "localhost:1234"},
+			want: runParams{
+				engineAddress: "localhost:1234",
+			},
+		},
+		{
+			desc:    "unknown option",
+			give:    []string{"-unknown-option", "bar", "localhost:1234"},
+			wantErr: "flag provided but not defined: -unknown-option",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.desc, func(t *testing.T) {
+			t.Parallel()
+
+			// Use a FlagSet with ContinueOnError for each case
+			// instead of using the global flag set.
+			//
+			// The global flag set uses flag.ExitOnError,
+			// so it cannot validate error cases during tests.
+			fset := flag.NewFlagSet(t.Name(), flag.ContinueOnError)
+			fset.SetOutput(iotest.LogWriter(t))
+
+			got, err := parseRunParams(fset, tt.give)
+			if tt.wantErr != "" {
+				assert.ErrorContains(t, err, tt.wantErr)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, &tt.want, got)
+			}
+		})
+	}
+}
+
+func TestGetPackage(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		Name      string
-		Mod       *modInfo
-		Expected  *pulumirpc.PluginDependency
-		ShouldErr bool
-		JSON      *plugin.PulumiPluginJSON
-		JSONPath  string
+		Name          string
+		Mod           *modInfo
+		Expected      *pulumirpc.PackageDependency
+		ExpectedError string
+		JSON          *plugin.PulumiPluginJSON
+		JSONPath      string
 	}{
 		{
 			Name: "valid-pulumi-mod",
@@ -41,7 +127,7 @@ func TestGetPlugin(t *testing.T) {
 				Path:    "github.com/pulumi/pulumi-aws/sdk",
 				Version: "v1.29.0",
 			},
-			Expected: &pulumirpc.PluginDependency{
+			Expected: &pulumirpc.PackageDependency{
 				Name:    "aws",
 				Version: "v1.29.0",
 			},
@@ -52,7 +138,7 @@ func TestGetPlugin(t *testing.T) {
 				Path:    "github.com/pulumi/pulumi-aws/sdk",
 				Version: "v1.29.1-0.20200403140640-efb5e2a48a86",
 			},
-			Expected: &pulumirpc.PluginDependency{
+			Expected: &pulumirpc.PackageDependency{
 				Name:    "aws",
 				Version: "v1.29.0",
 			},
@@ -63,7 +149,7 @@ func TestGetPlugin(t *testing.T) {
 				Path:    "github.com/moolumi/pulumi-aws/sdk",
 				Version: "v1.29.0",
 			},
-			ShouldErr: true,
+			ExpectedError: "module is not a pulumi provider",
 		},
 		{
 			Name: "invalid-version-module",
@@ -71,7 +157,7 @@ func TestGetPlugin(t *testing.T) {
 				Path:    "github.com/pulumi/pulumi-aws/sdk",
 				Version: "42-42-42",
 			},
-			ShouldErr: true,
+			ExpectedError: "module does not have semver compatible version",
 		},
 		{
 			Name: "pulumi-pulumi-mod",
@@ -79,7 +165,7 @@ func TestGetPlugin(t *testing.T) {
 				Path:    "github.com/pulumi/pulumi/sdk",
 				Version: "v1.14.0",
 			},
-			ShouldErr: true,
+			ExpectedError: "module is not a pulumi provider",
 		},
 		{
 			Name: "beta-pulumi-module",
@@ -87,7 +173,7 @@ func TestGetPlugin(t *testing.T) {
 				Path:    "github.com/pulumi/pulumi-aws/sdk",
 				Version: "v2.0.0-beta.1",
 			},
-			Expected: &pulumirpc.PluginDependency{
+			Expected: &pulumirpc.PackageDependency{
 				Name:    "aws",
 				Version: "v2.0.0-beta.1",
 			},
@@ -97,7 +183,7 @@ func TestGetPlugin(t *testing.T) {
 				Path:    "github.com/pulumi/pulumi-kubernetes/sdk",
 				Version: "v1.5.8",
 			},
-			Expected: &pulumirpc.PluginDependency{
+			Expected: &pulumirpc.PackageDependency{
 				Name:    "kubernetes",
 				Version: "v1.5.8",
 			},
@@ -108,7 +194,7 @@ func TestGetPlugin(t *testing.T) {
 				Path:    "github.com/me/myself/i",
 				Version: "invalid-Version",
 			},
-			Expected: &pulumirpc.PluginDependency{
+			Expected: &pulumirpc.PackageDependency{
 				Name:    "thing1",
 				Version: "v1.2.3",
 				Server:  "myserver.com",
@@ -121,9 +207,9 @@ func TestGetPlugin(t *testing.T) {
 			},
 		},
 		{
-			Name:      "non-resource",
-			Mod:       &modInfo{},
-			ShouldErr: true,
+			Name:          "non-resource",
+			Mod:           &modInfo{},
+			ExpectedError: "module is not a pulumi provider",
 			JSON: &plugin.PulumiPluginJSON{
 				Resource: false,
 			},
@@ -133,7 +219,7 @@ func TestGetPlugin(t *testing.T) {
 			Mod: &modInfo{
 				Dir: "/not/real",
 			},
-			ShouldErr: true,
+			ExpectedError: "module is not a pulumi provider",
 			JSON: &plugin.PulumiPluginJSON{
 				Name:    "thing2",
 				Version: "v1.2.3",
@@ -150,7 +236,7 @@ func TestGetPlugin(t *testing.T) {
 				Resource: true,
 			},
 			JSONPath: "go",
-			Expected: &pulumirpc.PluginDependency{
+			Expected: &pulumirpc.PackageDependency{
 				Name:    "name",
 				Version: "v1.2.3",
 			},
@@ -166,7 +252,7 @@ func TestGetPlugin(t *testing.T) {
 				Resource: true,
 			},
 			JSONPath: filepath.Join("go", "name"),
-			Expected: &pulumirpc.PluginDependency{
+			Expected: &pulumirpc.PackageDependency{
 				Name:    "name",
 				Version: "v1.2.3",
 			},
@@ -182,7 +268,7 @@ func TestGetPlugin(t *testing.T) {
 				Name:     "name",
 				Resource: true,
 			},
-			ShouldErr: true,
+			ExpectedError: "module is not a pulumi provider",
 		},
 		{
 			Name: "nested-wrong-folder",
@@ -195,7 +281,7 @@ func TestGetPlugin(t *testing.T) {
 				Name:     "name",
 				Resource: true,
 			},
-			ShouldErr: true,
+			ExpectedError: "module is not a pulumi provider",
 		},
 	}
 
@@ -205,21 +291,22 @@ func TestGetPlugin(t *testing.T) {
 			t.Parallel()
 
 			cwd := t.TempDir()
+			if c.Mod.Dir == "" {
+				c.Mod.Dir = cwd
+			}
 			if c.JSON != nil {
-				if c.Mod.Dir == "" {
-					c.Mod.Dir = cwd
-				}
 				path := filepath.Join(cwd, c.JSONPath)
-				err := os.MkdirAll(path, 0700)
+				err := os.MkdirAll(path, 0o700)
 				assert.NoErrorf(t, err, "Failed to setup test folder %s", path)
 				bytes, err := c.JSON.JSON()
 				assert.NoError(t, err, "Failed to setup test pulumi-plugin.json")
-				err = os.WriteFile(filepath.Join(path, "pulumi-plugin.json"), bytes, 0600)
+				err = os.WriteFile(filepath.Join(path, "pulumi-plugin.json"), bytes, 0o600)
 				assert.NoError(t, err, "Failed to write pulumi-plugin.json")
 			}
-			actual, err := c.Mod.getPlugin()
-			if c.ShouldErr {
-				assert.Error(t, err)
+
+			actual, err := c.Mod.getPackage(t.TempDir())
+			if c.ExpectedError != "" {
+				assert.EqualError(t, err, c.ExpectedError)
 			} else {
 				// Kind must be resource. We can thus exclude it from the test.
 				if c.Expected.Kind == "" {
@@ -230,4 +317,150 @@ func TestGetPlugin(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPluginsAndDependencies_moduleMode(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t,
+		fsutil.CopyFile(root, filepath.Join("testdata", "sample"), nil),
+		"copy test data")
+
+	testPluginsAndDependencies(t, filepath.Join(root, "prog"))
+}
+
+// Test for https://github.com/pulumi/pulumi/issues/12526.
+// Validates that if a Pulumi program has vendored its dependencies,
+// the language host can still find the plugin and run the program.
+func TestPluginsAndDependencies_vendored(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t,
+		fsutil.CopyFile(root, filepath.Join("testdata", "sample"), nil),
+		"copy test data")
+
+	progDir := filepath.Join(root, "prog")
+
+	// Vendor the dependencies and nuke the sources
+	// to ensure that the language host can only use the vendored version.
+	cmd := exec.Command("go", "mod", "vendor")
+	cmd.Dir = progDir
+	cmd.Stdout = iotest.LogWriter(t)
+	cmd.Stderr = iotest.LogWriter(t)
+	require.NoError(t, cmd.Run(), "vendor dependencies")
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "plugin")))
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "dep")))
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "indirect-dep")))
+
+	testPluginsAndDependencies(t, progDir)
+}
+
+// Regression test for https://github.com/pulumi/pulumi/issues/12963.
+// Verifies that the language host can find plugins and dependencies
+// when the Pulumi program is in a subdirectory of the project root.
+func TestPluginsAndDependencies_subdir(t *testing.T) {
+	t.Parallel()
+
+	t.Run("moduleMode", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+		require.NoError(t,
+			fsutil.CopyFile(root, filepath.Join("testdata", "sample"), nil),
+			"copy test data")
+
+		testPluginsAndDependencies(t, filepath.Join(root, "prog-subdir", "infra"))
+	})
+
+	t.Run("vendored", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+		require.NoError(t,
+			fsutil.CopyFile(root, filepath.Join("testdata", "sample"), nil),
+			"copy test data")
+
+		progDir := filepath.Join(root, "prog-subdir", "infra")
+
+		// Vendor the dependencies and nuke the sources
+		// to ensure that the language host can only use the vendored version.
+		cmd := exec.Command("go", "mod", "vendor")
+		cmd.Dir = progDir
+		cmd.Stdout = iotest.LogWriter(t)
+		cmd.Stderr = iotest.LogWriter(t)
+		require.NoError(t, cmd.Run(), "vendor dependencies")
+		require.NoError(t, os.RemoveAll(filepath.Join(root, "plugin")))
+		require.NoError(t, os.RemoveAll(filepath.Join(root, "dep")))
+		require.NoError(t, os.RemoveAll(filepath.Join(root, "indirect-dep")))
+
+		testPluginsAndDependencies(t, progDir)
+	})
+
+	t.Run("gowork", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+		require.NoError(t,
+			fsutil.CopyFile(root, filepath.Join("testdata", "sample"), nil),
+			"copy test data")
+
+		testPluginsAndDependencies(t, filepath.Join(root, "prog-gowork", "prog"))
+	})
+}
+
+func testPluginsAndDependencies(t *testing.T, progDir string) {
+	host := newLanguageHost("0.0.0.0:0", progDir, "")
+	ctx := context.Background()
+
+	t.Run("GetRequiredPackages", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		res, err := host.GetRequiredPackages(ctx, &pulumirpc.GetRequiredPackagesRequest{
+			Info: &pulumirpc.ProgramInfo{
+				RootDirectory:    progDir,
+				ProgramDirectory: progDir,
+				EntryPoint:       ".",
+			},
+		})
+		require.NoError(t, err)
+
+		require.Len(t, res.Packages, 1)
+		plug := res.Packages[0]
+
+		assert.Equal(t, "example", plug.Name, "plugin name")
+		assert.Equal(t, "v1.2.3", plug.Version, "plugin version")
+		assert.Equal(t, "resource", plug.Kind, "plugin kind")
+		assert.Equal(t, "example.com/download", plug.Server, "plugin server")
+	})
+
+	t.Run("GetProgramDependencies", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		res, err := host.GetProgramDependencies(ctx, &pulumirpc.GetProgramDependenciesRequest{
+			Project:                "deprecated",
+			Pwd:                    progDir,
+			TransitiveDependencies: true,
+			Info: &pulumirpc.ProgramInfo{
+				RootDirectory:    progDir,
+				ProgramDirectory: progDir,
+				EntryPoint:       ".",
+			},
+		})
+		require.NoError(t, err)
+
+		gotDeps := make(map[string]string) // name => version
+		for _, dep := range res.Dependencies {
+			gotDeps[dep.Name] = dep.Version
+		}
+
+		assert.Equal(t, map[string]string{
+			"github.com/pulumi/go-dependency-testdata/plugin":          "v1.2.3",
+			"github.com/pulumi/go-dependency-testdata/dep":             "v1.6.0",
+			"github.com/pulumi/go-dependency-testdata/indirect-dep/v2": "v2.1.0",
+		}, gotDeps)
+	})
 }
