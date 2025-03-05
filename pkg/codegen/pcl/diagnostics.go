@@ -1,3 +1,17 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package pcl
 
 import (
@@ -45,6 +59,15 @@ func resourceLoadError(token string, err error, tokenRange hcl.Range) *hcl.Diagn
 	return errorf(tokenRange, "error loading resource type '%s': %v", token, err)
 }
 
+func asWarningDiagnostic(diag *hcl.Diagnostic) *hcl.Diagnostic {
+	if diag == nil {
+		return diag
+	}
+
+	diag.Severity = hcl.DiagWarning
+	return diag
+}
+
 func unknownResourceType(token string, tokenRange hcl.Range) *hcl.Diagnostic {
 	return errorf(tokenRange, "unknown resource type '%s'", token)
 }
@@ -79,4 +102,8 @@ func duplicateBlock(blockType string, typeRange hcl.Range) *hcl.Diagnostic {
 
 func stringAttributeError(attr *model.Attribute) *hcl.Diagnostic {
 	return errorf(attr.Syntax.Expr.Range(), "attribute %v must be a string literal", attr.Name)
+}
+
+func boolAttributeError(attr *model.Attribute) *hcl.Diagnostic {
+	return errorf(attr.Syntax.Expr.Range(), "attribute %v must be a boolean literal", attr.Name)
 }

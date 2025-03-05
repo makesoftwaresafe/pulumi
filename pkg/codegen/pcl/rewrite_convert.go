@@ -1,3 +1,17 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package pcl
 
 import (
@@ -45,8 +59,8 @@ func sameSchemaTypes(xt, yt model.Type) bool {
 // rewriteConversions implements the core of RewriteConversions. It returns the rewritten expression and true if the
 // type of the expression may have changed.
 func rewriteConversions(x model.Expression, to model.Type, diags *hcl.Diagnostics) (model.Expression, bool) {
-	if x == nil {
-		return nil, false
+	if x == nil || to == nil {
+		return x, false
 	}
 	// If rewriting an operand changed its type and the type of the expression depends on the type of that operand, the
 	// expression must be typechecked in order to update its type.
@@ -251,6 +265,8 @@ func RewriteConversions(x model.Expression, to model.Type) (model.Expression, hc
 func convertPrimitiveValues(from model.Expression, to model.Type) (model.Expression, bool) {
 	var expression model.Expression
 	switch {
+	case from == nil || to == nil:
+		return from, false
 	case to.AssignableFrom(from.Type()) || to.AssignableFrom(model.DynamicType):
 		return nil, false
 	case to.AssignableFrom(model.BoolType):
@@ -279,7 +295,7 @@ func convertPrimitiveValues(from model.Expression, to model.Type) (model.Express
 	}
 
 	diags := expression.Typecheck(false)
-	contract.Assert(len(diags) == 0)
+	contract.Assertf(len(diags) == 0, "error typechecking expression: %v", diags)
 
 	expression.SetLeadingTrivia(from.GetLeadingTrivia())
 	expression.SetTrailingTrivia(from.GetTrailingTrivia())
@@ -312,10 +328,27 @@ func convertLiteralToString(from model.Expression) (string, bool) {
 		}
 	case *model.LiteralValueExpression:
 		if stringValue, err := convert.Convert(expr.Value, cty.String); err == nil {
+			if stringValue.IsNull() {
+				return "", false
+			}
 			return stringValue.AsString(), true
 		}
 	}
 	return "", false
+}
+
+func literalExprValue(expr model.Expression) (cty.Value, bool) {
+	if lit, ok := expr.(*model.LiteralValueExpression); ok {
+		return lit.Value, true
+	}
+
+	if templateExpr, ok := expr.(*model.TemplateExpression); ok {
+		if len(templateExpr.Parts) == 1 {
+			return literalExprValue(templateExpr.Parts[0])
+		}
+	}
+
+	return cty.NilVal, false
 }
 
 // lowerConversion performs the main logic of LowerConversion. nil, false is
@@ -327,6 +360,19 @@ func lowerConversion(from model.Expression, to model.Type) (model.Type, bool) {
 	case *model.UnionType:
 		// Assignment: it just works
 		for _, to := range to.ElementTypes {
+			// in general, strings are not assignable to enums, but we allow it here
+			// if the enum has an element that matches the `from` expression
+			switch enumType := to.(type) {
+			case *model.EnumType:
+				if literal, ok := literalExprValue(from); ok {
+					for _, enumCase := range enumType.Elements {
+						if enumCase.RawEquals(literal) {
+							return to, true
+						}
+					}
+				}
+			}
+
 			if to.AssignableFrom(from.Type()) {
 				return to, true
 			}

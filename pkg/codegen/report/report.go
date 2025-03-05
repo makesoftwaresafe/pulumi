@@ -27,8 +27,8 @@ import (
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
 	hcl2 "github.com/pulumi/pulumi/pkg/v3/codegen/pcl"
-	"github.com/pulumi/pulumi/pkg/v3/version"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/env"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/version"
 )
 
 var ExportTargetDir = env.String("CODEGEN_REPORT_DIR",
@@ -122,11 +122,11 @@ func WrapGen(reporter Reporter, title, language string, files []*syntax.File, f 
 func (r *reporter) Report(title, language string, files []*syntax.File, diags hcl.Diagnostics, err error) {
 	r.m.Lock()
 	defer r.m.Unlock()
-	if panicErr := recover(); panicErr != nil {
-		if panic, ok := panicErr.(error); ok {
-			err = fmt.Errorf("panic: %w", panic)
+	if panicVal := recover(); panicVal != nil {
+		if panicErr, ok := panicVal.(error); ok {
+			err = fmt.Errorf("panic: %w", panicErr)
 		} else {
-			err = fmt.Errorf("panic: %v", panicErr)
+			err = fmt.Errorf("panic: %v", panicVal)
 		}
 	}
 	failed := diags.HasErrors() || err != nil
@@ -222,7 +222,7 @@ func (r *reporter) defaultExport(dir string) error {
 	}
 
 	if info, err := os.Stat(dir); os.IsNotExist(err) {
-		err := os.MkdirAll(dir, 0700)
+		err := os.MkdirAll(dir, 0o700)
 		if err != nil {
 			return err
 		}
@@ -240,6 +240,5 @@ func (r *reporter) defaultExport(dir string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
-
+	return os.WriteFile(path, data, 0o600)
 }

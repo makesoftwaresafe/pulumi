@@ -63,12 +63,12 @@ func (p *unixPipes) writer() io.Writer {
 }
 
 func (p *unixPipes) connect() error {
-	if err := syscall.Mkfifo(path.Join(p.dir, "invoke_req"), 0600); err != nil {
+	if err := syscall.Mkfifo(path.Join(p.dir, "invoke_req"), 0o600); err != nil {
 		logging.V(10).Infof("createPipes: Received error opening request pipe: %s\n", err)
 		return err
 	}
 
-	if err := syscall.Mkfifo(path.Join(p.dir, "invoke_res"), 0600); err != nil {
+	if err := syscall.Mkfifo(path.Join(p.dir, "invoke_res"), 0o600); err != nil {
 		logging.V(10).Infof("createPipes: Received error opening result pipe: %s\n", err)
 		return err
 	}
@@ -91,13 +91,11 @@ func (p *unixPipes) connect() error {
 func (p *unixPipes) shutdown() {
 	if p.reqPipe != nil {
 		contract.IgnoreClose(p.reqPipe)
-		contract.IgnoreError(os.Remove(p.reqPath))
 	}
 
 	if p.resPipe != nil {
 		contract.IgnoreClose(p.resPipe)
-		contract.IgnoreError(os.Remove(p.resPath))
 	}
 
-	contract.IgnoreError(os.Remove(p.dir))
+	contract.IgnoreError(os.RemoveAll(p.dir))
 }

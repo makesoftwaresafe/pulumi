@@ -18,6 +18,7 @@ import asyncio
 import copy
 import warnings
 from typing import (
+    Awaitable,
     Optional,
     List,
     Any,
@@ -31,19 +32,18 @@ from typing import (
     cast,
 )
 from . import _types
-from .metadata import get_project, get_stack
 from .runtime import known_types
 from .runtime.resource import (
+    _pkg_from_type,
     get_resource,
     register_resource,
     register_resource_outputs,
     read_resource,
     collapse_alias_to_urn,
     create_urn as create_urn_internal,
-    convert_providers,
 )
 from .runtime.settings import get_root_resource
-from .output import _is_prompt, _map_input, _map2_input, T, Output
+from .output import _is_prompt, _map_input, _map2_input, Output
 from . import urn as urn_util
 from . import log
 
@@ -139,7 +139,7 @@ class Alias:
     parent of the resource is used (`opts.parent` if provided, else the implicit stack resource
     parent).
 
-    To specify no original parent, use `Alias(parent=pulumi.rootStackResource)`.
+    To specify no original parent, use `Alias(parent=pulumi.ROOT_STACK_RESOURCE)`.
     """
 
     stack: Optional["Input[str]"]
@@ -245,7 +245,90 @@ ResourceTransformation is the callback signature for the `transformations` resou
 transformation is passed the same set of inputs provided to the `Resource` constructor, and can
 optionally return back alternate values for the `props` and/or `opts` prior to the resource
 actually being created.  The effect will be as though those props and opts were passed in place
-of the original call to the `Resource` constructor.  If the transformation returns undefined,
+of the original call to the `Resource` constructor.  If the transformation returns None,
+this indicates that the resource will not be transformed.
+"""
+
+
+class ResourceTransformArgs:
+    """
+    ResourceTransformArgs is the argument bag passed to a resource transform.
+    """
+
+    custom: bool
+    """
+    If the resource is a custom or component resource.
+    """
+
+    type_: str
+    """
+    The type of the Resource.
+    """
+
+    name: str
+    """
+    The name of the Resource.
+    """
+
+    props: "Inputs"
+    """
+    The original properties passed to the Resource constructor.
+    """
+
+    opts: "ResourceOptions"
+    """
+    The original resource options passed to the Resource constructor.
+    """
+
+    def __init__(
+        self,
+        custom: bool,
+        type_: str,
+        name: str,
+        props: "Inputs",
+        opts: "ResourceOptions",
+    ) -> None:
+        self.custom = custom
+        self.type_ = type_
+        self.name = name
+        self.props = props
+        self.opts = opts
+
+
+class ResourceTransformResult:
+    """
+    ResourceTransformResult is the result that must be returned by a resource transform callback.
+    It includes new values to use for the `props` and `opts` of the `Resource` in place of the
+    originally provided values.
+    """
+
+    props: "Inputs"
+    """
+    The new properties to use in place of the original `props`.
+    """
+
+    opts: "ResourceOptions"
+    """
+    The new resource options to use in place of the original `opts`
+    """
+
+    def __init__(self, props: "Inputs", opts: "ResourceOptions") -> None:
+        self.props = props
+        self.opts = opts
+
+
+ResourceTransform = Callable[
+    [ResourceTransformArgs],
+    Optional[
+        Union[Awaitable[Optional[ResourceTransformResult]], ResourceTransformResult]
+    ],
+]
+"""
+ResourceTransform is the callback signature for the `transforms` resource option.  A
+transform is passed the same set of inputs provided to the `Resource` constructor, and can
+optionally return back alternate values for the `props` and/or `opts` prior to the resource
+actually being created.  The effect will be as though those props and opts were passed in place
+of the original call to the `Resource` constructor.  If the transform returns None,
 this indicates that the resource will not be transformed.
 """
 
@@ -336,6 +419,15 @@ class ResourceOptions:
     parents walking from the resource up to the stack.
     """
 
+    transforms: Optional[List[ResourceTransform]]
+    """
+    Optional list of transforms to apply to this resource during construction. The
+    transforms are applied in order, and are applied prior to transform applied to
+    parents walking from the resource up to the stack.
+
+    This is experimental.
+    """
+
     id: Optional["Input[str]"]
     """
     An optional existing ID to load, rather than create.
@@ -372,7 +464,6 @@ class ResourceOptions:
     if specified resource is being deleted as well.
     """
 
-    # pylint: disable=redefined-builtin
     def __init__(
         self,
         parent: Optional["Resource"] = None,
@@ -393,6 +484,7 @@ class ResourceOptions:
         import_: Optional[str] = None,
         custom_timeouts: Optional["CustomTimeouts"] = None,
         transformations: Optional[List[ResourceTransformation]] = None,
+        transforms: Optional[List[ResourceTransform]] = None,
         urn: Optional[str] = None,
         replace_on_changes: Optional[List[str]] = None,
         plugin_download_url: Optional[str] = None,
@@ -423,13 +515,15 @@ class ResourceOptions:
         :param Optional[List[str]] additional_secret_outputs: If provided, a list of output property names that should
                also be treated as secret.
         :param Optional[Input[str]] id: If provided, an existing resource ID to read, rather than create.
-        :param Optional[str] import_: When provided with a resource ID, import indicates that this resource's provider should
+        :param Optional[str] import\\_: When provided with a resource ID, import indicates that this resource's provider should
                import its state from the cloud resource with the given ID. The inputs to the resource's constructor must align
                with the resource's current state. Once a resource has been imported, the import property must be removed from
                the resource's options.
         :param Optional[CustomTimeouts] custom_timeouts: If provided, a config block for custom timeout information.
         :param Optional[List[ResourceTransformation]] transformations: If provided, a list of transformations to apply
                to this resource during construction.
+        :param Optional[List[ResourceTransform]] transforms: If provided, a list of transforms to apply
+               to this resource during construction. This is experimental.
         :param Optional[str] urn: The URN of a previously-registered resource of this type to read from the engine.
         :param Optional[List[str]] replace_on_changes: Changes to any of these property paths will force a replacement.
                If this list includes `"*"`, changes to any properties will force a replacement.  Initialization errors
@@ -441,11 +535,6 @@ class ResourceOptions:
         :param Optional[Resource] deleted_with: If set, the providers Delete method will not be called for this resource
                if specified resource is being deleted as well.
         """
-
-        # Expose 'merge' again this this object, but this time as an instance method.
-        # TODO[python/mypy#2427]: mypy disallows method assignment
-        self.merge = self._merge_instance  # type: ignore
-        self.merge.__func__.__doc__ = ResourceOptions.merge.__doc__  # type: ignore
 
         self.parent = parent
         self.protect = protect
@@ -461,6 +550,7 @@ class ResourceOptions:
         self.id = id
         self.import_ = import_
         self.transformations = transformations
+        self.transforms = transforms
         self.urn = urn
         self.replace_on_changes = replace_on_changes
         self.depends_on = depends_on
@@ -474,12 +564,9 @@ class ResourceOptions:
         if isinstance(deps, list):
             for dep in deps:
                 if _is_prompt(dep) and not isinstance(dep, Resource):
-                    raise Exception(
+                    raise TypeError(
                         f"'depends_on' was passed a value {dep} that was not a Resource."
                     )
-
-    def _merge_instance(self, opts: "ResourceOptions") -> "ResourceOptions":
-        return ResourceOptions.merge(self, opts)
 
     def _depends_on_list(self) -> "Input[List[Input[Resource]]]":
         if self.depends_on is None:
@@ -524,13 +611,8 @@ class ResourceOptions:
         # The fix is to re-assign merge after the copy.
 
         out = copy.copy(self)
-        # Expose 'merge' again this this object, but this time as an instance method.
-        # TODO[python/mypy#2427]: mypy disallows method assignment
-        out.merge = out._merge_instance  # type: ignore
         return out
 
-    # pylint: disable=method-hidden
-    @staticmethod
     def merge(
         opts1: Optional["ResourceOptions"], opts2: Optional["ResourceOptions"]
     ) -> "ResourceOptions":
@@ -603,6 +685,7 @@ class ResourceOptions:
         dest.transformations = _merge_lists(
             dest.transformations, source.transformations
         )
+        dest.transforms = _merge_lists(dest.transforms, source.transforms)
 
         dest.parent = dest.parent if source.parent is None else source.parent
         dest.protect = dest.protect if source.protect is None else source.protect
@@ -660,7 +743,7 @@ def _collapse_providers(opts: "ResourceOptions"):
                 for prov in providers:
                     opts.providers[prov.package] = prov
             elif isinstance(providers, dict):
-                for key, prov in providers:
+                for key, prov in providers.items():
                     opts.providers[key] = prov
 
 
@@ -740,6 +823,7 @@ class Resource:
         opts: Optional[ResourceOptions] = None,
         remote: bool = False,
         dependency: bool = False,
+        package_ref: Optional[Awaitable[Optional[str]]] = None,
     ) -> None:
         """
         :param str t: The type of this resource.
@@ -753,6 +837,7 @@ class Resource:
                resource.
         :param bool remote: True if this is a remote component resource.
         :param bool dependency: True if this is a synthetic resource used internally for dependency tracking.
+        :param Optional[Awaitable[Optional[str]]] package_ref: The package reference for this resource.
         """
 
         if dependency:
@@ -780,11 +865,14 @@ class Resource:
         # If `props` is an input type, convert it into an untranslated dictionary.
         # Translation of the keys will happen later using the type's and resource's type/name metadata.
         # If `props` is not an input type, set `typ` to None to make translation behave as it has previously.
-        typ = type(props)
+        typ: Optional[type] = type(props)
+        assert typ is not None
         if _types.is_input_type(typ):
             props = _types.input_type_to_untranslated_dict(props)
         else:
-            typ = None  # type: ignore
+            if not isinstance(props, Mapping):
+                raise TypeError("Expected resource properties to be a mapping")
+            typ = None
 
         # Before anything else - if there are transformations registered, give them a chance to run to modify the user
         # provided properties and options assigned to this resource.
@@ -843,15 +931,11 @@ class Resource:
             # Infer providers and provider maps from parent, if one was provided.
             self._providers = opts.parent._providers
 
-        type_components = t.split(":")
-        pkg = None
-        if len(type_components) == 3:
-            [pkg, _, _] = type_components
-
-        opts.provider, providers = self._get_providers(t, pkg, opts)
+        pkg = _pkg_from_type(t)
+        opts.provider, opts.providers = self._get_providers(t, pkg, opts)
 
         self._protect = bool(opts.protect)
-        self._provider = opts.provider if custom else None
+        self._provider = opts.provider if (custom or remote) else None
         if self._provider and self._provider.package != pkg:
             action = (
                 "get"
@@ -863,7 +947,7 @@ class Resource:
             raise ValueError(
                 f"Attempted to {action} resource {t} with a provider for '{self._provider.package}'"
             )
-        self._providers = providers
+        self._providers = opts.providers
         self._version = opts.version
         self._plugin_download_url = opts.plugin_download_url
         if opts.urn is not None:
@@ -875,10 +959,21 @@ class Resource:
                 raise Exception(
                     "Cannot read an existing resource unless it has a custom provider"
                 )
-            read_resource(cast("CustomResource", self), t, name, props, opts, typ)
+            read_resource(
+                cast("CustomResource", self), t, name, props, opts, typ, package_ref
+            )
         else:
             register_resource(
-                self, t, name, custom, remote, DependencyResource, props, opts, typ
+                self,
+                t,
+                name,
+                custom,
+                remote,
+                DependencyResource,
+                props,
+                opts,
+                typ,
+                package_ref,
             )
 
     def _get_providers(
@@ -920,16 +1015,25 @@ class Resource:
             Optional[ProviderResource], opts.parent and opts.parent.get_provider(t)
         )
 
-        provider = opts.provider or ambient_provider or parent_provider
+        provider = ambient_provider or parent_provider
+        if opts.provider:
+            # If an explicit provider was passed in,
+            # its package may or may not match the package we're looking for.
+            provider_pkg = opts.provider.package
+            if pkg == provider_pkg:
+                # Explicit provider takes precedence over parent or ambient providers.
+                provider = opts.provider
 
-        if pkg and opts.provider:
-            if pkg in opts_providers:
-                message = f"There is a conflict between the `provider` field ({pkg}) and a member of the `providers` map"
-                depreciation = "This will become an error by the end of July 2022. See https://github.com/pulumi/pulumi/issues/8799 for more details"
-                warnings.warn(f"{message} for resource {t}. " + depreciation)
-                log.warn(f"{message}. {depreciation}", resource=self)
+            # Regardless of whether it matches,
+            # we still want to keep the provider in the
+            # providers map, so that it can be used for child resources.
+            if provider_pkg in opts_providers:
+                message = f"There is a conflict between the `provider` field ({provider_pkg}) and a member of the `providers` map"
+                deprecation = "This will become an error in a future version. See https://github.com/pulumi/pulumi/issues/8799 for more details"
+                warnings.warn(f"{message} for resource {t}. " + deprecation)
+                log.warn(f"{message}. {deprecation}", resource=self)
             else:
-                opts_providers[pkg] = opts.provider
+                opts_providers[provider_pkg] = opts.provider
 
         # opts_providers takes priority over self._providers
         providers = {**self._providers, **opts_providers}
@@ -985,11 +1089,10 @@ class Resource:
         :return: The :class:`ProviderResource` associated with the given module member, or None if one does not exist.
         :rtype: Optional[ProviderResource]
         """
-        components = module_member.split(":")
-        if len(components) != 3:
+        pkg = _pkg_from_type(module_member)
+        if pkg is None:
             return None
 
-        [pkg, _, _] = components
         return self._providers.get(pkg)
 
 
@@ -1008,6 +1111,7 @@ class CustomResource(Resource):
         props: Optional["Inputs"] = None,
         opts: Optional[ResourceOptions] = None,
         dependency: bool = False,
+        package_ref: Optional[Awaitable[Optional[str]]] = None,
     ) -> None:
         """
         :param str t: The type of this resource.
@@ -1016,8 +1120,11 @@ class CustomResource(Resource):
         :param Optional[ResourceOptions] opts: Optional set of :class:`pulumi.ResourceOptions` to use for this
                resource.
         :param bool dependency: True if this is a synthetic resource used internally for dependency tracking.
+        :param Optional[Awaitable[Optional[str]]] package_ref: The package reference for this resource.
         """
-        Resource.__init__(self, t, name, True, props, opts, False, dependency)
+        Resource.__init__(
+            self, t, name, True, props, opts, False, dependency, package_ref
+        )
 
     @property
     def id(self) -> "Output[str]":
@@ -1044,6 +1151,7 @@ class ComponentResource(Resource):
         props: Optional["Inputs"] = None,
         opts: Optional[ResourceOptions] = None,
         remote: bool = False,
+        package_ref: Optional[Awaitable[Optional[str]]] = None,
     ) -> None:
         """
         :param str t: The type of this resource.
@@ -1052,9 +1160,11 @@ class ComponentResource(Resource):
         :param Optional[ResourceOptions] opts: Optional set of :class:`pulumi.ResourceOptions` to use for this
                resource.
         :param bool remote: True if this is a remote component resource.
+        :param Optional[Awaitable[Optional[str]]] package_ref: The package reference for this resource.
         """
-        Resource.__init__(self, t, name, False, props, opts, remote, False)
-        self.__dict__["id"] = None
+        Resource.__init__(self, t, name, False, props, opts, remote, False, package_ref)
+        if not remote:
+            self.__dict__["id"] = None
         self._remote = remote
 
     def register_outputs(self, outputs: "Inputs"):
@@ -1085,6 +1195,7 @@ class ProviderResource(CustomResource):
         props: Optional["Inputs"] = None,
         opts: Optional[ResourceOptions] = None,
         dependency: bool = False,
+        package_ref: Optional[Awaitable[Optional[str]]] = None,
     ) -> None:
         """
         :param str pkg: The package type of this provider resource.
@@ -1093,6 +1204,7 @@ class ProviderResource(CustomResource):
         :param Optional[ResourceOptions] opts: Optional set of :class:`pulumi.ResourceOptions` to use for this
                resource.
         :param bool dependency: True if this is a synthetic resource used internally for dependency tracking.
+        :param Optional[Awaitable[Optional[str]]] package_ref: The package reference for this resource.
         """
 
         if opts is not None and opts.provider is not None:
@@ -1101,7 +1213,7 @@ class ProviderResource(CustomResource):
             )
         # Provider resources are given a well-known type, prefixed with "pulumi:providers".
         CustomResource.__init__(
-            self, f"pulumi:providers:{pkg}", name, props, opts, dependency
+            self, f"pulumi:providers:{pkg}", name, props, opts, dependency, package_ref
         )
         self.package = pkg
 

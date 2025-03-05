@@ -85,7 +85,7 @@ func (d DocLanguageHelper) GetLanguageTypeString(pkg *schema.Package, moduleName
 		namespaces:    d.Namespaces,
 		rootNamespace: info.GetRootNamespace(),
 	}
-	qualifier := "Inputs" //nolint:goconst
+	qualifier := "Inputs"
 	if !input {
 		qualifier = "Outputs"
 	}
@@ -108,8 +108,8 @@ func (d DocLanguageHelper) GetMethodName(m *schema.Method) string {
 }
 
 func (d DocLanguageHelper) GetMethodResultName(pkg *schema.Package, modName string, r *schema.Resource,
-	m *schema.Method) string {
-
+	m *schema.Method,
+) string {
 	var returnType *schema.ObjectType
 	if m.Function.ReturnType != nil {
 		if objectType, ok := m.Function.ReturnType.(*schema.ObjectType); ok {
@@ -178,7 +178,7 @@ func (d DocLanguageHelper) GetModuleDocLink(pkg *schema.Package, modName string)
 	var displayName string
 	var link string
 	if modName == "" {
-		displayName = fmt.Sprintf("Pulumi.%s", namespaceName(d.Namespaces, pkg.Name))
+		displayName = "Pulumi." + namespaceName(d.Namespaces, pkg.Name)
 	} else {
 		displayName = fmt.Sprintf("Pulumi.%s.%s", namespaceName(d.Namespaces, pkg.Name), modName)
 	}

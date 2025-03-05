@@ -41,7 +41,7 @@ func (s *RemoteStack) Name() string {
 }
 
 // Preview preforms a dry-run update to a stack, returning pending changes.
-// https://www.pulumi.com/docs/reference/cli/pulumi_preview/
+// https://www.pulumi.com/docs/cli/commands/pulumi_preview/
 // This operation runs remotely.
 func (s *RemoteStack) Preview(ctx context.Context, opts ...optremotepreview.Option) (PreviewResult, error) {
 	preOpts := &optremotepreview.Options{}
@@ -64,7 +64,7 @@ func (s *RemoteStack) Preview(ctx context.Context, opts ...optremotepreview.Opti
 }
 
 // Up creates or updates the resources in a stack by executing the program in the Workspace.
-// https://www.pulumi.com/docs/reference/cli/pulumi_up/
+// https://www.pulumi.com/docs/cli/commands/pulumi_up/
 // This operation runs remotely.
 func (s *RemoteStack) Up(ctx context.Context, opts ...optremoteup.Option) (UpResult, error) {
 	upOpts := &optremoteup.Options{}
@@ -146,7 +146,6 @@ func (s *RemoteStack) History(ctx context.Context, pageSize, page int) ([]Update
 // Cancel stops a stack's currently running update. It returns an error if no update is currently running.
 // Note that this operation is _very dangerous_, and may leave the stack in an inconsistent state
 // if a resource operation was pending when the update was canceled.
-// This command is not supported for local backends.
 func (s *RemoteStack) Cancel(ctx context.Context) error {
 	return s.stack.Cancel(ctx)
 }

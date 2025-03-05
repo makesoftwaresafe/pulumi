@@ -1,22 +1,39 @@
+// Copyright 2019-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package plugin
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
-	"sync"
 	"testing"
 
-	structpb "github.com/golang/protobuf/ptypes/struct"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/diag/colors"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/asset"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/testing/diagtest"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 )
 
@@ -183,7 +200,8 @@ func TestNestedSecret(t *testing.T) {
 		"secretArray": resource.NewArrayProperty([]resource.PropertyValue{
 			resource.NewStringProperty("hello"),
 			resource.MakeSecret(resource.NewStringProperty("shh")),
-			resource.NewStringProperty("goodbye")}),
+			resource.NewStringProperty("goodbye"),
+		}),
 		"secretMap": resource.MakeSecret(resource.NewObjectProperty(resource.PropertyMap{
 			"a": resource.NewStringProperty("a"),
 			"b": resource.NewStringProperty("b"),
@@ -199,7 +217,8 @@ func TestNestedSecret(t *testing.T) {
 		"secretArray": resource.NewArrayProperty([]resource.PropertyValue{
 			resource.NewStringProperty("shh"),
 			resource.NewStringProperty("hello"),
-			resource.NewStringProperty("goodbye")}),
+			resource.NewStringProperty("goodbye"),
+		}),
 		"secretMap": resource.MakeSecret(resource.NewObjectProperty(resource.PropertyMap{
 			"a": resource.NewStringProperty("a"),
 			"b": resource.NewStringProperty("b"),
@@ -220,7 +239,8 @@ func TestNestedSecret(t *testing.T) {
 		"secretArray": resource.MakeSecret(resource.NewArrayProperty([]resource.PropertyValue{
 			resource.NewStringProperty("shh"),
 			resource.NewStringProperty("hello"),
-			resource.NewStringProperty("goodbye")})),
+			resource.NewStringProperty("goodbye"),
+		})),
 		"secretMap": resource.MakeSecret(resource.NewObjectProperty(resource.PropertyMap{
 			"a": resource.NewStringProperty("a"),
 			"b": resource.NewStringProperty("b"),
@@ -237,95 +257,448 @@ func TestNestedSecret(t *testing.T) {
 	assert.Truef(t, reflect.DeepEqual(to, expected), "did not match expected after annotation")
 }
 
-func TestPluginConfigPromise(t *testing.T) {
+func TestRestoreElidedAssetContents(t *testing.T) {
+	t.Parallel()
+	textAsset := func(text string) resource.PropertyValue {
+		asset, err := asset.FromText(text)
+		require.NoError(t, err)
+		return resource.NewAssetProperty(asset)
+	}
+
+	original := resource.PropertyMap{
+		"source": textAsset("Hello world"),
+		"nested": resource.NewObjectProperty(resource.PropertyMap{
+			"another":      textAsset("Another"),
+			"doubleNested": textAsset("Double nested"),
+			"tripleNested": resource.NewObjectProperty(resource.PropertyMap{
+				"secret": resource.MakeSecret(textAsset("Secret content")),
+			}),
+		}),
+		"insideArray": resource.NewArrayProperty([]resource.PropertyValue{
+			textAsset("First"),
+			textAsset("Second"),
+			resource.NewObjectProperty(resource.PropertyMap{
+				"nestedArray": resource.NewArrayProperty([]resource.PropertyValue{
+					textAsset("Nested array"),
+					resource.MakeSecret(textAsset("another secret content")),
+				}),
+			}),
+		}),
+	}
+
+	serialized, err := MarshalProperties(original, MarshalOptions{
+		ElideAssetContents: true,
+		KeepSecrets:        true,
+	})
+	require.NoError(t, err, "failed to marshal properties")
+
+	deserialized, err := UnmarshalProperties(serialized, MarshalOptions{
+		KeepSecrets: true,
+	})
+	require.NoError(t, err, "failed to unmarshal properties")
+
+	originalRaw := original.Mappable()
+	deserializedRaw := deserialized.Mappable()
+
+	// the deserialized properties are not the same as the original, because during marshalling
+	// we skipped the contents of assets with the option `ElideAssetContents` set to true.
+	assert.NotEqual(t, originalRaw, deserializedRaw)
+
+	// but if we restore the elided contents, we should get the original properties back.
+	restoreElidedAssetContents(original, deserialized)
+	deserializedRaw = deserialized.Mappable()
+	assert.Equal(t, originalRaw, deserializedRaw)
+}
+
+// Tests that Delete requests are correctly marshalled and sent to the engine.
+func TestProvider_DeleteRequests(t *testing.T) {
 	t.Parallel()
 
-	t.Run("many gets", func(t *testing.T) {
-		t.Parallel()
+	// Arrange.
+	id := resource.ID("foo")
+	urn := resource.NewURN("org/proj/dev", "foo", "", "pulumi:provider:aws", "qux")
 
-		prom := newPluginConfigPromise()
-		ctx := context.Background()
+	tests := []struct {
+		desc string
+		give DeleteRequest
+		want *pulumirpc.DeleteRequest
+	}{
+		{
+			desc: "empty",
+			give: DeleteRequest{
+				ID:  id,
+				URN: urn,
+			},
+			want: &pulumirpc.DeleteRequest{
+				Id:         string(id),
+				Urn:        string(urn),
+				Name:       "qux",
+				Type:       "pulumi:provider:aws",
+				OldInputs:  &structpb.Struct{Fields: map[string]*structpb.Value{}},
+				Properties: &structpb.Struct{Fields: map[string]*structpb.Value{}},
+			},
+		},
+		{
+			desc: "inputs",
+			give: DeleteRequest{
+				ID:  id,
+				URN: urn,
+				Inputs: resource.PropertyMap{
+					"foo": resource.NewStringProperty("bar"),
+				},
+			},
+			want: &pulumirpc.DeleteRequest{
+				Id:   string(id),
+				Urn:  string(urn),
+				Name: "qux",
+				Type: "pulumi:provider:aws",
+				OldInputs: &structpb.Struct{
+					Fields: map[string]*structpb.Value{
+						"foo": {Kind: &structpb.Value_StringValue{StringValue: "bar"}},
+					},
+				},
+				Properties: &structpb.Struct{Fields: map[string]*structpb.Value{}},
+			},
+		},
+		{
+			desc: "outputs",
+			give: DeleteRequest{
+				ID:  id,
+				URN: urn,
+				Outputs: resource.PropertyMap{
+					"baz": resource.NewStringProperty("quux"),
+				},
+			},
+			want: &pulumirpc.DeleteRequest{
+				Id:        string(id),
+				Urn:       string(urn),
+				Name:      "qux",
+				Type:      "pulumi:provider:aws",
+				OldInputs: &structpb.Struct{Fields: map[string]*structpb.Value{}},
+				Properties: &structpb.Struct{
+					Fields: map[string]*structpb.Value{
+						"baz": {Kind: &structpb.Value_StringValue{StringValue: "quux"}},
+					},
+				},
+			},
+		},
+		{
+			desc: "timeout",
+			give: DeleteRequest{
+				ID:      id,
+				URN:     urn,
+				Timeout: 30,
+			},
+			want: &pulumirpc.DeleteRequest{
+				Id:         string(id),
+				Urn:        string(urn),
+				Name:       "qux",
+				Type:       "pulumi:provider:aws",
+				OldInputs:  &structpb.Struct{Fields: map[string]*structpb.Value{}},
+				Properties: &structpb.Struct{Fields: map[string]*structpb.Value{}},
+				Timeout:    30,
+			},
+		},
+		{
+			desc: "all",
+			give: DeleteRequest{
+				ID:  id,
+				URN: urn,
+				Inputs: resource.PropertyMap{
+					"foo": resource.NewStringProperty("bar"),
+				},
+				Outputs: resource.PropertyMap{
+					"baz": resource.NewStringProperty("quux"),
+				},
+				Timeout: 30,
+			},
+			want: &pulumirpc.DeleteRequest{
+				Id:   string(id),
+				Urn:  string(urn),
+				Name: "qux",
+				Type: "pulumi:provider:aws",
+				OldInputs: &structpb.Struct{
+					Fields: map[string]*structpb.Value{
+						"foo": {Kind: &structpb.Value_StringValue{StringValue: "bar"}},
+					},
+				},
+				Properties: &structpb.Struct{
+					Fields: map[string]*structpb.Value{
+						"baz": {Kind: &structpb.Value_StringValue{StringValue: "quux"}},
+					},
+				},
+				Timeout: 30,
+			},
+		},
+	}
 
-		cfg := pluginConfig{
-			known:           true,
-			acceptSecrets:   true,
-			acceptResources: true,
-			acceptOutputs:   true,
-			supportsPreview: true,
-		}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.desc, func(t *testing.T) {
+			t.Parallel()
 
-		var wg sync.WaitGroup
-		for i := 0; i < 10; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			var got *pulumirpc.DeleteRequest
+			client := &stubClient{
+				ConfigureF: func(req *pulumirpc.ConfigureRequest) (*pulumirpc.ConfigureResponse, error) {
+					return &pulumirpc.ConfigureResponse{
+						AcceptSecrets: true,
+					}, nil
+				},
+				DeleteF: func(req *pulumirpc.DeleteRequest) error {
+					got = req
+					return nil
+				},
+			}
 
-				got, err := prom.Await(ctx)
-				assert.NoError(t, err)
-				assert.Equal(t, cfg, got)
-			}()
-		}
+			p := NewProviderWithClient(newTestContext(t), "pkgA", client, false /* disablePreview */)
 
-		prom.Fulfill(cfg, nil)
-		wg.Wait()
-	})
+			// We have to configure before we can use Delete.
+			_, err := p.Configure(context.Background(), ConfigureRequest{})
+			assert.NoError(t, err, "Configure failed")
 
-	t.Run("error", func(t *testing.T) {
-		t.Parallel()
-
-		giveErr := errors.New("great sadness")
-		prom := newPluginConfigPromise()
-		ctx := context.Background()
-
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-
-			_, err := prom.Await(ctx)
-			assert.ErrorIs(t, err, giveErr)
-		}()
-
-		prom.Fulfill(pluginConfig{}, giveErr)
-		<-done
-	})
-
-	t.Run("set twice", func(t *testing.T) {
-		t.Parallel()
-
-		prom := newPluginConfigPromise()
-		ctx := context.Background()
-
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			got, err := prom.Await(ctx)
+			// Act.
+			_, err = p.Delete(context.Background(), tt.give)
 			assert.NoError(t, err)
-			assert.Equal(t, pluginConfig{acceptSecrets: true}, got)
-		}()
 
-		prom.Fulfill(pluginConfig{acceptSecrets: true}, nil)
-		prom.Fulfill(pluginConfig{acceptOutputs: true}, errors.New("ignored"))
+			// Assert.
+			assert.NotNil(t, got, "Delete was not called")
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
 
-		// Should still see the first configuration.
-		got, err := prom.Await(ctx)
-		assert.NoError(t, err)
-		assert.Equal(t, pluginConfig{acceptSecrets: true}, got)
+func TestProvider_ConstructOptions(t *testing.T) {
+	t.Parallel()
 
-		wg.Wait()
-	})
+	// Helper to keep a some test cases simple.
+	// Takes a pointer to a container (slice or map)
+	// and sets it to nil if it's empty.
+	nilIfEmpty := func(s any) {
+		// The code below is roughly equivalent to:
+		//	if len(*s) == 0 {
+		//		*s = nil
+		//	}
+		v := reflect.ValueOf(s) // *T for some T = []T or map[T]*
+		v = v.Elem()            // *T -> T
+		if v.Len() == 0 {
+			// Zero value of a slice or map is nil.
+			v.Set(reflect.Zero(v.Type()))
+		}
+	}
 
-	t.Run("await cancelled", func(t *testing.T) {
-		t.Parallel()
+	tests := []struct {
+		desc   string
+		give   ConstructOptions
+		want   *pulumirpc.ConstructRequest
+		parent resource.URN
+	}{
+		{
+			desc: "empty",
+			want: &pulumirpc.ConstructRequest{},
+		},
+		{
+			desc: "aliases",
+			give: ConstructOptions{
+				Aliases: []resource.Alias{
+					{URN: resource.URN("urn:pulumi:stack::project::type::oldName")},
+					{URN: resource.URN("urn:pulumi:stack::project::type::anotherOldName")},
+				},
+			},
+			want: &pulumirpc.ConstructRequest{
+				Aliases: []string{
+					"urn:pulumi:stack::project::type::oldName",
+					"urn:pulumi:stack::project::type::anotherOldName",
+				},
+			},
+		},
+		{
+			desc: "dependencies",
+			give: ConstructOptions{
+				Dependencies: []resource.URN{
+					"urn:pulumi:stack::project::type::dep1",
+					"urn:pulumi:stack::project::type::dep2",
+				},
+			},
+			want: &pulumirpc.ConstructRequest{
+				Dependencies: []string{
+					"urn:pulumi:stack::project::type::dep1",
+					"urn:pulumi:stack::project::type::dep2",
+				},
+			},
+		},
+		{
+			desc: "protect",
+			give: ConstructOptions{
+				Protect: true,
+			},
+			want: &pulumirpc.ConstructRequest{
+				Protect: true,
+			},
+		},
+		{
+			desc: "providers",
+			give: ConstructOptions{
+				Providers: map[string]string{
+					"pkg1": "prov1",
+					"pkg2": "prov2",
+				},
+			},
+			want: &pulumirpc.ConstructRequest{
+				Providers: map[string]string{
+					"pkg1": "prov1",
+					"pkg2": "prov2",
+				},
+			},
+		},
+		{
+			desc: "property dependencies",
+			give: ConstructOptions{
+				PropertyDependencies: map[resource.PropertyKey][]resource.URN{
+					"foo": {"urn:pulumi:stack::project::type::dep1"},
+					"bar": {"urn:pulumi:stack::project::type::dep2"},
+				},
+			},
+			want: &pulumirpc.ConstructRequest{
+				InputDependencies: map[string]*pulumirpc.ConstructRequest_PropertyDependencies{
+					"foo": {Urns: []string{"urn:pulumi:stack::project::type::dep1"}},
+					"bar": {Urns: []string{"urn:pulumi:stack::project::type::dep2"}},
+				},
+			},
+		},
+		{
+			desc: "additional secret outputs",
+			give: ConstructOptions{
+				AdditionalSecretOutputs: []string{"foo", "bar"},
+			},
+			want: &pulumirpc.ConstructRequest{
+				AdditionalSecretOutputs: []string{"foo", "bar"},
+			},
+		},
+		{
+			desc: "custom timeouts",
+			give: ConstructOptions{
+				CustomTimeouts: &CustomTimeouts{
+					Create: "1s",
+					Update: "2s",
+					Delete: "3s",
+				},
+			},
+			want: &pulumirpc.ConstructRequest{
+				CustomTimeouts: &pulumirpc.ConstructRequest_CustomTimeouts{
+					Create: "1s",
+					Update: "2s",
+					Delete: "3s",
+				},
+			},
+		},
+		{
+			desc: "deleted with",
+			give: ConstructOptions{
+				DeletedWith: "urn:pulumi:stack::project::type::dep1",
+			},
+			want: &pulumirpc.ConstructRequest{
+				DeletedWith: "urn:pulumi:stack::project::type::dep1",
+			},
+		},
+		{
+			desc: "delete before replace",
+			give: ConstructOptions{
+				DeleteBeforeReplace: true,
+			},
+			want: &pulumirpc.ConstructRequest{
+				DeleteBeforeReplace: true,
+			},
+		},
+		{
+			desc: "ignore changes",
+			give: ConstructOptions{
+				IgnoreChanges: []string{"foo", "bar"},
+			},
+			want: &pulumirpc.ConstructRequest{
+				IgnoreChanges: []string{"foo", "bar"},
+			},
+		},
+		{
+			desc: "replace on changes",
+			give: ConstructOptions{
+				ReplaceOnChanges: []string{"foo", "bar"},
+			},
+			want: &pulumirpc.ConstructRequest{
+				ReplaceOnChanges: []string{"foo", "bar"},
+			},
+		},
+		{
+			desc: "retain on delete",
+			give: ConstructOptions{
+				RetainOnDelete: true,
+			},
+			want: &pulumirpc.ConstructRequest{
+				RetainOnDelete: true,
+			},
+		},
+	}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.desc, func(t *testing.T) {
+			t.Parallel()
 
-		prom := newPluginConfigPromise()
-		_, err := prom.Await(ctx)
-		assert.ErrorIs(t, err, context.Canceled)
-	})
+			// These values are the same for all test cases,
+			// and are not affected by ConstructOptions.
+			tt.want.Project = "project"
+			tt.want.Stack = "stack"
+			tt.want.Type = "type"
+			tt.want.Name = "name"
+			tt.want.Config = make(map[string]string)
+			tt.want.Inputs = &structpb.Struct{Fields: make(map[string]*structpb.Value)}
+			tt.want.AcceptsOutputValues = true
+
+			var got *pulumirpc.ConstructRequest
+			client := &stubClient{
+				ConfigureF: func(req *pulumirpc.ConfigureRequest) (*pulumirpc.ConfigureResponse, error) {
+					return &pulumirpc.ConfigureResponse{
+						AcceptSecrets: true,
+					}, nil
+				},
+				ConstructF: func(req *pulumirpc.ConstructRequest) (*pulumirpc.ConstructResponse, error) {
+					// To keep test cases simple and avoid
+					// having to duplicate empty slices for
+					// them, nil out empty slices that are
+					// otherwise always set.
+					nilIfEmpty(&req.Aliases)
+					nilIfEmpty(&req.ConfigSecretKeys)
+					nilIfEmpty(&req.Dependencies)
+					nilIfEmpty(&req.InputDependencies)
+
+					got = req
+					return &pulumirpc.ConstructResponse{
+						Urn: "urn:pulumi:stack::project::type::name",
+					}, nil
+				},
+			}
+
+			p := NewProviderWithClient(newTestContext(t), "foo", client, false /* disablePreview */)
+
+			// Must configure before we can use Construct.
+			_, err := p.Configure(context.Background(), ConfigureRequest{})
+			require.NoError(t, err, "configure failed")
+
+			_, err = p.Construct(context.Background(),
+				ConstructRequest{
+					Info:    ConstructInfo{Project: "project", Stack: "stack"},
+					Type:    "type",
+					Name:    "name",
+					Parent:  tt.parent,
+					Inputs:  resource.PropertyMap{},
+					Options: tt.give,
+				},
+			)
+			require.NoError(t, err)
+
+			require.NotNil(t, got, "Client.Construct was not called")
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 // This test detects a data race between Configure and Delete
@@ -340,19 +713,6 @@ func TestPluginConfigPromise(t *testing.T) {
 func TestProvider_ConfigureDeleteRace(t *testing.T) {
 	t.Parallel()
 
-	cwd, err := os.Getwd()
-	require.NoError(t, err)
-
-	sink := diag.DefaultSink(
-		os.Stdout,
-		os.Stderr,
-		diag.FormatOptions{
-			Color: colors.Never,
-		},
-	)
-	ctx, err := NewContext(sink, sink, nil /* host */, nil /* source */, cwd, nil /* options */, false, nil /* span */)
-	require.NoError(t, err)
-
 	var gotSecret *structpb.Value
 	client := &stubClient{
 		ConfigureF: func(req *pulumirpc.ConfigureRequest) (*pulumirpc.ConfigureResponse, error) {
@@ -366,7 +726,7 @@ func TestProvider_ConfigureDeleteRace(t *testing.T) {
 		},
 	}
 
-	p := NewProviderWithClient(ctx, "foo", client, false)
+	p := NewProviderWithClient(newTestContext(t), "foo", client, false /* disablePreview */)
 
 	props := resource.PropertyMap{
 		"foo": resource.NewSecretProperty(&resource.Secret{
@@ -382,19 +742,23 @@ func TestProvider_ConfigureDeleteRace(t *testing.T) {
 		defer close(done)
 
 		close(deleting)
-		_, err := p.Delete(
+		_, err := p.Delete(context.Background(), DeleteRequest{
 			resource.NewURN("org/proj/dev", "foo", "", "bar:baz", "qux"),
+			"qux",
+			"bar:baz",
 			"whatever",
 			props,
+			props,
 			1000,
-		)
+		})
 		assert.NoError(t, err, "Delete failed")
 	}()
 
 	// Wait until delete request has been sent to Configure
 	// and then wait until Delete has finished.
 	<-deleting
-	assert.NoError(t, p.Configure(props))
+	_, err := p.Configure(context.Background(), ConfigureRequest{Inputs: props})
+	assert.NoError(t, err)
 	<-done
 
 	s, ok := gotSecret.Kind.(*structpb.Value_StructValue)
@@ -404,11 +768,51 @@ func TestProvider_ConfigureDeleteRace(t *testing.T) {
 	}, s.StructValue.Fields["value"].GetKind())
 }
 
+// newTestContext builds a *Context for use in tests.
+func newTestContext(t testing.TB) *Context {
+	t.Helper()
+
+	cwd, err := os.Getwd()
+	require.NoError(t, err, "get working directory")
+
+	sink := diagtest.LogSink(t)
+	ctx, err := NewContext(
+		sink, sink,
+		nil /* host */, nil /* source */, cwd, nil /* options */, false, nil /* span */)
+	require.NoError(t, err, "build context")
+
+	return ctx
+}
+
 type stubClient struct {
 	pulumirpc.ResourceProviderClient
 
-	ConfigureF func(*pulumirpc.ConfigureRequest) (*pulumirpc.ConfigureResponse, error)
-	DeleteF    func(*pulumirpc.DeleteRequest) error
+	DiffConfigF func(*pulumirpc.DiffRequest) (*pulumirpc.DiffResponse, error)
+	ConstructF  func(*pulumirpc.ConstructRequest) (*pulumirpc.ConstructResponse, error)
+	ConfigureF  func(*pulumirpc.ConfigureRequest) (*pulumirpc.ConfigureResponse, error)
+	DeleteF     func(*pulumirpc.DeleteRequest) error
+}
+
+func (c *stubClient) DiffConfig(
+	ctx context.Context,
+	req *pulumirpc.DiffRequest,
+	opts ...grpc.CallOption,
+) (*pulumirpc.DiffResponse, error) {
+	if f := c.DiffConfigF; f != nil {
+		return f(req)
+	}
+	return c.ResourceProviderClient.DiffConfig(ctx, req, opts...)
+}
+
+func (c *stubClient) Construct(
+	ctx context.Context,
+	req *pulumirpc.ConstructRequest,
+	opts ...grpc.CallOption,
+) (*pulumirpc.ConstructResponse, error) {
+	if f := c.ConstructF; f != nil {
+		return f(req)
+	}
+	return c.ResourceProviderClient.Construct(ctx, req, opts...)
 }
 
 func (c *stubClient) Configure(
@@ -432,4 +836,103 @@ func (c *stubClient) Delete(
 		return &emptypb.Empty{}, err
 	}
 	return c.ResourceProviderClient.Delete(ctx, req, opts...)
+}
+
+// Test for https://github.com/pulumi/pulumi/issues/14529, ensure a kubernetes DiffConfig error is ignored
+func TestKubernetesDiffError(t *testing.T) {
+	t.Parallel()
+
+	diffErr := status.Errorf(codes.Unknown, "failed to parse kubeconfig: %s",
+		fmt.Errorf("couldn't get version/kind; json parse error: %w",
+			errors.New("json: cannot unmarshal string into Go value of type struct "+
+				"{ APIVersion string \"json:\\\"apiVersion,omitempty\\\"\"; Kind string \"json:\\\"kind,omitempty\\\"\" }")))
+
+	client := &stubClient{
+		DiffConfigF: func(req *pulumirpc.DiffRequest) (*pulumirpc.DiffResponse, error) {
+			return nil, diffErr
+		},
+	}
+
+	// Test that the error from 14529 is NOT ignored if reported by something other than kubernetes
+	az := NewProviderWithClient(newTestContext(t), "azure", client, false /* disablePreview */)
+	_, err := az.DiffConfig(context.Background(), DiffConfigRequest{
+		resource.NewURN("org/proj/dev", "foo", "", "pulumi:provider:azure", "qux"),
+		"",
+		"",
+		resource.PropertyMap{},
+		resource.PropertyMap{},
+		resource.PropertyMap{},
+		false,
+		nil,
+	})
+	assert.ErrorContains(t, err, "failed to parse kubeconfig")
+
+	// Test that the error from 14529 is ignored if reported by kubernetes
+	k8s := NewProviderWithClient(newTestContext(t), "kubernetes", client, false /* disablePreview */)
+	diff, err := k8s.DiffConfig(context.Background(), DiffConfigRequest{
+		resource.NewURN("org/proj/dev", "foo", "", "pulumi:provider:kubernetes", "qux"),
+		"",
+		"",
+		resource.PropertyMap{},
+		resource.PropertyMap{},
+		resource.PropertyMap{},
+		false,
+		nil,
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, DiffUnknown, diff.Changes)
+
+	// Test that some other error is not ignored if reported by kubernetes
+	diffErr = status.Errorf(codes.Unknown, "some other error")
+	_, err = k8s.DiffConfig(context.Background(), DiffConfigRequest{
+		resource.NewURN("org/proj/dev", "foo", "", "pulumi:provider:kubernetes", "qux"),
+		"",
+		"",
+		resource.PropertyMap{},
+		resource.PropertyMap{},
+		resource.PropertyMap{},
+		false,
+		nil,
+	})
+	assert.ErrorContains(t, err, "some other error")
+}
+
+//nolint:paralleltest // using t.Setenv which is incompatible with t.Parallel
+func TestGetProviderAttachPort(t *testing.T) {
+	t.Run("no attach", func(t *testing.T) {
+		aws := tokens.Package("aws")
+		port, err := GetProviderAttachPort(aws)
+		require.NoError(t, err)
+		require.Nil(t, port)
+	})
+	t.Run("aws:12345", func(t *testing.T) {
+		t.Setenv("PULUMI_DEBUG_PROVIDERS", "aws:12345")
+		aws := tokens.Package("aws")
+		port, err := GetProviderAttachPort(aws)
+		require.NoError(t, err)
+		require.NotNil(t, port)
+		require.Equal(t, 12345, *port)
+	})
+	t.Run("gcp:999,aws:12345", func(t *testing.T) {
+		t.Setenv("PULUMI_DEBUG_PROVIDERS", "gcp:999,aws:12345")
+		aws := tokens.Package("aws")
+		port, err := GetProviderAttachPort(aws)
+		require.NoError(t, err)
+		require.NotNil(t, port)
+		require.Equal(t, 12345, *port)
+	})
+	t.Run("gcp:999", func(t *testing.T) {
+		t.Setenv("PULUMI_DEBUG_PROVIDERS", "gcp:999")
+		aws := tokens.Package("aws")
+		port, err := GetProviderAttachPort(aws)
+		require.NoError(t, err)
+		require.Nil(t, port)
+	})
+	t.Run("invalid", func(t *testing.T) {
+		t.Setenv("PULUMI_DEBUG_PROVIDERS", "aws:port")
+		aws := tokens.Package("aws")
+		port, err := GetProviderAttachPort(aws)
+		require.Error(t, err)
+		require.Nil(t, port)
+	})
 }

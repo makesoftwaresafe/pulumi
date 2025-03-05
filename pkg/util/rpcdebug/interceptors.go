@@ -15,9 +15,9 @@
 package rpcdebug
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -26,9 +26,9 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 type DebugInterceptor struct {
@@ -48,7 +48,7 @@ type LogOptions struct {
 // Each LogFile should have a unique instance of DebugInterceptor for proper locking.
 func NewDebugInterceptor(opts DebugInterceptorOptions) (*DebugInterceptor, error) {
 	if opts.LogFile == "" {
-		return nil, fmt.Errorf("logFile cannot be empty")
+		return nil, errors.New("logFile cannot be empty")
 	}
 	i := &DebugInterceptor{logFile: opts.LogFile}
 
@@ -81,7 +81,8 @@ func (i *DebugInterceptor) DialOptions(opts LogOptions) []grpc.DialOption {
 // configure the location of the Go file.
 func (i *DebugInterceptor) DebugServerInterceptor(opts LogOptions) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{},
-		info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		info *grpc.UnaryServerInfo, handler grpc.UnaryHandler,
+	) (interface{}, error) {
 		log := debugInterceptorLogEntry{
 			Method:   info.FullMethod,
 			Metadata: opts.Metadata,
@@ -113,7 +114,8 @@ func (i *DebugInterceptor) DebugStreamServerInterceptor(opts LogOptions) grpc.St
 // Like debugServerInterceptor but for GRPC client connections.
 func (i *DebugInterceptor) DebugClientInterceptor(opts LogOptions) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply interface{},
-		cc *grpc.ClientConn, invoker grpc.UnaryInvoker, gopts ...grpc.CallOption) error {
+		cc *grpc.ClientConn, invoker grpc.UnaryInvoker, gopts ...grpc.CallOption,
+	) error {
 		// Ignoring weird entries with empty method and nil req and reply.
 		if method == "" {
 			return invoker(ctx, method, req, reply, cc, gopts...)
@@ -125,7 +127,11 @@ func (i *DebugInterceptor) DebugClientInterceptor(opts LogOptions) grpc.UnaryCli
 		}
 		i.trackRequest(&log, req)
 		err := invoker(ctx, method, req, reply, cc, gopts...)
-		i.trackResponse(&log, reply)
+		if err != nil {
+			i.track(&log, err)
+		} else {
+			i.trackResponse(&log, reply)
+		}
 		if e := i.record(log); e != nil {
 			return e
 		}
@@ -136,8 +142,8 @@ func (i *DebugInterceptor) DebugClientInterceptor(opts LogOptions) grpc.UnaryCli
 // Like debugClientInterceptor but for streaming calls.
 func (i *DebugInterceptor) DebugStreamClientInterceptor(opts LogOptions) grpc.StreamClientInterceptor {
 	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string,
-		streamer grpc.Streamer, gopts ...grpc.CallOption) (grpc.ClientStream, error) {
-
+		streamer grpc.Streamer, gopts ...grpc.CallOption,
+	) (grpc.ClientStream, error) {
 		stream, err := streamer(ctx, desc, cc, method, gopts...)
 
 		wrappedStream := &debugClientStream{
@@ -155,14 +161,14 @@ func (i *DebugInterceptor) record(log debugInterceptorLogEntry) error {
 	i.mutex.Lock()
 	defer i.mutex.Unlock()
 
-	f, err := os.OpenFile(i.logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(i.logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		return fmt.Errorf("Failed to append GRPC debug logs to file %s: %v", i.logFile, err)
+		return fmt.Errorf("Failed to append GRPC debug logs to file %s: %w", i.logFile, err)
 	}
 	defer f.Close()
 
 	if err := json.NewEncoder(f).Encode(log); err != nil {
-		return fmt.Errorf("Failed to encode GRPC debug logs: %v", err)
+		return fmt.Errorf("Failed to encode GRPC debug logs: %w", err)
 	}
 	return nil
 }
@@ -194,19 +200,18 @@ func (*DebugInterceptor) transcode(obj interface{}) (json.RawMessage, error) {
 		return json.RawMessage("null"), nil
 	}
 
-	m, ok := obj.(proto.Message)
+	m, ok := obj.(protoreflect.ProtoMessage)
 	if !ok {
 		return json.RawMessage("null"),
-			fmt.Errorf("Failed to decode, expecting proto.Message, got %v",
+			fmt.Errorf("failed to decode, expecting protoreflect.ProtoMessage, got %v",
 				reflect.TypeOf(obj))
 	}
 
-	jsonSer := jsonpb.Marshaler{}
-	buf := bytes.Buffer{}
-	if err := jsonSer.Marshal(&buf, m); err != nil {
+	buf, err := protojson.Marshal(m)
+	if err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	return buf, nil
 }
 
 // Wraps grpc.ServerStream with interceptor hooks for SendMsg, RecvMsg.

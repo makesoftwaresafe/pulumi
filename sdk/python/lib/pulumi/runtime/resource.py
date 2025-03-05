@@ -13,13 +13,14 @@
 # limitations under the License.
 import asyncio
 import os
+import pathlib
 import traceback
 from typing import (
+    Awaitable,
     TYPE_CHECKING,
     Any,
     Callable,
     Dict,
-    Iterable,
     List,
     Mapping,
     NamedTuple,
@@ -36,14 +37,26 @@ from google.protobuf import struct_pb2
 from .. import _types, log
 from .. import urn as urn_util
 from ..output import Input, Output
-from ..runtime.proto import alias_pb2, resource_pb2
+from ..runtime.proto import alias_pb2, resource_pb2, source_pb2, callback_pb2
 from . import known_types, rpc, settings
-from .resource_cycle_breaker import declare_dependency
-from .rpc_manager import RPC_MANAGER
-from .settings import handle_grpc_error
+from ._depends_on import _resolve_depends_on_urns
+from .rpc import _expand_dependencies
+from .settings import (
+    _get_callbacks,
+    _get_rpc_manager,
+    _sync_monitor_supports_transforms,
+    handle_grpc_error,
+)
 
 if TYPE_CHECKING:
-    from .. import Alias, CustomResource, Inputs, ProviderResource, Resource
+    from .. import (
+        Alias,
+        CustomResource,
+        Inputs,
+        ProviderResource,
+        Resource,
+        CustomTimeouts,
+    )
     from ..resource import ResourceOptions
 
 
@@ -144,8 +157,15 @@ async def prepare_aliases(
     return aliases
 
 
+async def _create_provider_ref(provider: "ProviderResource") -> str:
+    # Wait for the provider to resolve and construct a provider reference from it.
+    # A provider reference is a well-known string (two ::-separated values) that the engine interprets.
+    urn = await provider.urn.future()
+    pid = await provider.id.future() or rpc.UNKNOWN
+    return f"{urn}::{pid}"
+
+
 # Prepares for an RPC that will manufacture a resource, and hence deals with input and output properties.
-# pylint: disable=too-many-locals
 async def prepare_resource(
     res: "Resource",
     ty: str,
@@ -159,7 +179,7 @@ async def prepare_resource(
     explicit_urn_dependencies: Set[str] = set()
     if opts is not None and opts.depends_on is not None:
         explicit_urn_dependencies = await _resolve_depends_on_urns(
-            opts, from_resource=res
+            opts._depends_on_list(), from_resource=res
         )
 
     # Serialize out all our props to their final values.  In doing so, we'll also collect all
@@ -171,14 +191,20 @@ async def prepare_resource(
     if typ is not None:
         translate = None
 
-    # To initially scope the use of this new feature, we only keep output values when
-    # remote is true (for multi-lang components).
     serialized_props = await rpc.serialize_properties(
         props,
         property_dependencies_resources,
+        res,
         translate,
         typ,
+        # To initially scope the use of this new feature, we only keep output values when
+        # remote is true (for multi-lang components, i.e. MLCs).
         keep_output_values=remote,
+        # When remote is true, exclude resource references from `propertyDependencies`.
+        # This way, component providers creating outputs for component inputs based
+        # on `propertyDependencies` won't create outputs for properties that only
+        # contain resource references.
+        exclude_resource_refs_from_deps=remote,
     )
 
     # Wait for our parent to resolve
@@ -194,14 +220,16 @@ async def prepare_resource(
 
     # Construct the provider reference, if we were given a provider to use.
     provider_ref = None
-    if custom and opts is not None and opts.provider is not None:
-        provider = opts.provider
-
-        # If we were given a provider, wait for it to resolve and construct a provider reference from it.
-        # A provider reference is a well-known string (two ::-separated values) that the engine interprets.
-        provider_urn = await provider.urn.future()
-        provider_id = await provider.id.future() or rpc.UNKNOWN
-        provider_ref = f"{provider_urn}::{provider_id}"
+    send_provider = custom
+    if remote and opts is not None and opts.provider is not None:
+        # If it's a remote component and a provider was specified, only
+        # send the provider in the request if the provider's package is
+        # the same as the component's package.
+        pkg = _pkg_from_type(ty)
+        if pkg is not None and pkg == opts.provider.package:
+            send_provider = True
+    if send_provider and opts is not None and opts.provider is not None:
+        provider_ref = await _create_provider_ref(opts.provider)
 
     # For remote resources, merge any provider opts into a single dict, and then create a new dict with all of the
     # resolved provider refs.
@@ -209,17 +237,13 @@ async def prepare_resource(
     if (remote or not custom) and opts is not None:
         providers = convert_providers(opts.provider, opts.providers)
         for name, provider in providers.items():
-            # If we were given providers, wait for them to resolve and construct provider references from them.
-            # A provider reference is a well-known string (two ::-separated values) that the engine interprets.
-            urn = await provider.urn.future()
-            id_ = await provider.id.future() or rpc.UNKNOWN
-            ref = f"{urn}::{id_}"
-            provider_refs[name] = ref
+            provider_refs[name] = await _create_provider_ref(provider)
 
     dependencies: Set[str] = set(explicit_urn_dependencies)
     property_dependencies: Dict[str, List[str]] = {}
     for key, deps in property_dependencies_resources.items():
-        urns = await _expand_dependencies(deps, from_resource=res)
+        expanded_deps = await _expand_dependencies(deps, from_resource=res)
+        urns = set(expanded_deps.keys())
         dependencies |= urns
         property_dependencies[key] = list(urns)
 
@@ -453,7 +477,6 @@ def create_urn(
     parent_prefix: Optional[Output[str]] = None
     if parent is not None:
         parent_urn = None
-        # pylint: disable=import-outside-toplevel
         from .. import Resource
 
         if isinstance(parent, Resource):
@@ -518,7 +541,7 @@ def get_resource(
         (resolve_id, res.__dict__["id"]) = resource_output(res)
 
     # Like the other resource functions, "transfer" all input properties onto unresolved futures on res.
-    resolvers = rpc.transfer_properties(res, props)
+    resolvers = rpc.transfer_properties(res, props, custom)
 
     async def do_get():
         try:
@@ -527,10 +550,9 @@ def get_resource(
             monitor = settings.get_monitor()
             inputs = await rpc.serialize_properties({"urn": urn}, {})
 
-            accept_resources = not (
-                os.getenv("PULUMI_DISABLE_RESOURCE_REFERENCES", "").upper()
-                in {"TRUE", "1"}
-            )
+            accept_resources = os.getenv(
+                "PULUMI_DISABLE_RESOURCE_REFERENCES", ""
+            ).upper() not in {"TRUE", "1"}
             req = resource_pb2.ResourceInvokeRequest(
                 tok="pulumi:pulumi:getResource",
                 args=inputs,
@@ -582,10 +604,11 @@ def get_resource(
             resp["state"],
             {},
             resolvers,
+            custom,
             transform_using_type_metadata,
         )
 
-    asyncio.ensure_future(RPC_MANAGER.do_rpc("get resource", do_get)())
+    asyncio.ensure_future(_get_rpc_manager().do_rpc("get resource", do_get)())
 
 
 def _translate_ignore_changes(
@@ -641,6 +664,55 @@ def _translate_replace_on_changes(
     return replace_on_changes
 
 
+def _get_source_position() -> Optional[source_pb2.SourcePosition]:
+    """
+    Returns the source position of the first stack frame in user code. This should look up to find what called into the
+    core sdk (i.e. Resource.__init__) and then skip that caller type if it is a Resource or ComponentResource.
+
+    This is used to compute the source position of the user code that instantiated a resource.
+    """
+
+    # This is somewhat brittle in that it expects a call stack of the form:
+    # - register_resource/read_resource
+    # - Resource class constructor
+    # - abstract Resource subclass constructor (CustomResource or ComponentResource)
+    # - concrete Resource subclass constructor (this maybe split into __internal_init__)
+    # - user code
+    #
+    # This stack reflects the expected class hierarchy of "cloud resource / component resource < customresource/componentresource < resource".
+
+    # Capture a stack that includes the last 7 frames, this should be enough to cover the above.
+    stack = traceback.extract_stack(limit=7)
+
+    # Look up the stack to find the third __init__ frame (the first is Resource, the second is
+    # CustomResource/ComponentResource, the third should be the concrete resource, including skipping any __internal_init__ function)
+    n = 0  # how many __inits__ we've seen
+    for i in range(len(stack) - 1, -1, -1):
+        f = stack[i]
+        if f.name == "__init__":
+            n = n + 1
+            if n == 3:
+                break
+
+    # If we didn't find the third init frame before the end then just return None
+    if i < 1:
+        return None
+
+    # Extract the Ith stack frame. If that frame is missing file or line information, return the empty string.
+    caller = stack[i - 1]
+    if caller.filename == "" or caller.lineno is None:
+        return None
+
+    try:
+        uri = pathlib.Path(caller.filename).as_uri()
+    except BaseException:  # noqa: BLE001 catch blind exception
+        return None
+
+    # Convert the Ith source position to a source position URI by converting the filename to a URI and appending
+    # the line and column fragment.
+    return source_pb2.SourcePosition(uri=uri, line=caller.lineno)
+
+
 def read_resource(
     res: "CustomResource",
     ty: str,
@@ -648,6 +720,7 @@ def read_resource(
     props: "Inputs",
     opts: "ResourceOptions",
     typ: Optional[type] = None,
+    package_ref: Optional[Awaitable[Optional[str]]] = None,
 ) -> None:
     if opts.id is None:
         raise Exception("Cannot read resource whose options are lacking an ID value")
@@ -675,7 +748,11 @@ def read_resource(
     (resolve_id, res.__dict__["id"]) = resource_output(res)
 
     # Like below, "transfer" all input properties onto unresolved futures on res.
-    resolvers = rpc.transfer_properties(res, props)
+    custom = True  # Reads are always for custom resources (non-components)
+    resolvers = rpc.transfer_properties(res, props, custom)
+
+    # Get the source position.
+    source_position = _get_source_position()
 
     async def do_read():
         try:
@@ -686,7 +763,7 @@ def read_resource(
             # because a "read" resource does not actually have any dependencies at all in the cloud
             # provider sense, because a read resource already exists. We do not need to track this
             # dependency.
-            resolved_id = await rpc.serialize_property(opts.id, [])
+            resolved_id = await rpc.serialize_property(opts.id, [], None)
             log.debug(f"read prepared: ty={ty}, name={name}, id={opts.id}")
 
             # These inputs will end up in the snapshot, so if there are any additional secret
@@ -695,10 +772,21 @@ def read_resource(
                 res, typ, opts.additional_secret_outputs
             )
 
-            accept_resources = not (
-                os.getenv("PULUMI_DISABLE_RESOURCE_REFERENCES", "").upper()
-                in {"TRUE", "1"}
-            )
+            accept_resources = os.getenv(
+                "PULUMI_DISABLE_RESOURCE_REFERENCES", ""
+            ).upper() not in {"TRUE", "1"}
+
+            # If we have a package reference, we need to wait for it to resolve.
+            package_ref_str = None
+            if package_ref is not None:
+                package_ref_str = await package_ref
+                # If we have a package reference we can clear some of the invoke
+                # options.
+                if package_ref_str is not None:
+                    opts.plugin_download_url = None
+                    opts.version = None
+                    log.debug(f"Read using package reference {package_ref_str}")
+
             req = resource_pb2.ReadResourceRequest(
                 type=ty,
                 name=name,
@@ -712,6 +800,8 @@ def read_resource(
                 acceptSecrets=True,
                 acceptResources=accept_resources,
                 additionalSecretOutputs=additional_secret_outputs,
+                sourcePosition=source_position,
+                packageRef=package_ref_str or "",
             )
 
             mock_urn = await create_urn(name, ty, resolver.parent_urn).future()
@@ -720,7 +810,7 @@ def read_resource(
                 if monitor is None:
                     # If no monitor is available, we'll need to fake up a response, for testing.
                     return RegisterResponse(
-                        mock_urn or "", None, resolver.serialized_props, None
+                        mock_urn or "", None, resolver.serialized_props, None, None
                     )
 
                 # If there is a monitor available, make the true RPC request to the engine.
@@ -750,10 +840,36 @@ def read_resource(
             resp.properties,
             {},
             resolvers,
+            custom,
             transform_using_type_metadata,
         )
 
-    asyncio.ensure_future(RPC_MANAGER.do_rpc("read resource", do_read)())
+    asyncio.ensure_future(_get_rpc_manager().do_rpc("read resource", do_read)())
+
+
+def _create_custom_timeouts(
+    custom_timeouts: "CustomTimeouts",
+) -> "resource_pb2.RegisterResourceRequest.CustomTimeouts":
+    result = resource_pb2.RegisterResourceRequest.CustomTimeouts()
+    # It could be an actual CustomTimeouts object.
+    if known_types.is_custom_timeouts(custom_timeouts):
+        if custom_timeouts.create is not None:
+            result.create = custom_timeouts.create
+        if custom_timeouts.update is not None:
+            result.update = custom_timeouts.update
+        if custom_timeouts.delete is not None:
+            result.delete = custom_timeouts.delete
+    # Or, it could be a workaround passing in a dict.
+    elif isinstance(custom_timeouts, dict):
+        if "create" in custom_timeouts:
+            result.create = custom_timeouts["create"]
+        if "update" in custom_timeouts:
+            result.update = custom_timeouts["update"]
+        if "delete" in custom_timeouts:
+            result.delete = custom_timeouts["delete"]
+    else:
+        raise Exception("Expected custom_timeouts to be a CustomTimeouts object")
+    return result
 
 
 def register_resource(
@@ -766,6 +882,7 @@ def register_resource(
     props: "Inputs",
     opts: Optional["ResourceOptions"],
     typ: Optional[type] = None,
+    package_ref: Optional[Awaitable[Optional[str]]] = None,
 ) -> None:
     """
     Registers a new resource object with a given type t and name.  It returns the
@@ -797,25 +914,62 @@ def register_resource(
     # Now "transfer" all input properties into unresolved futures on res.  This way,
     # this resource will look like it has all its output properties to anyone it is
     # passed to.  However, those futures won't actually resolve until the RPC returns
-    resolvers = rpc.transfer_properties(res, props)
+    resolvers = rpc.transfer_properties(res, props, custom)
+
+    # Get the source position.
+    source_position = _get_source_position()
 
     async def do_register() -> None:
         try:
-            from ..resource import (  # pylint: disable=import-outside-toplevel
+            from ..resource import (
                 ResourceOptions,
             )
 
             nonlocal opts
             opts = opts if opts is not None else ResourceOptions()
 
-            resolver = await prepare_resource(res, ty, custom, remote, props, opts, typ)
+            # If we have a package reference, we need to wait for it to resolve.
+            package_ref_str = None
+            if package_ref is not None:
+                package_ref_str = await package_ref
+                # If we have a package reference we can clear some of the resource options
+                if package_ref_str is not None:
+                    opts.plugin_download_url = None
+                    opts.version = None
+
+            try:
+                resolver = await prepare_resource(
+                    res, ty, custom, remote, props, opts, typ
+                )
+            except ValueError as e:
+                raise ValueError(
+                    f"While processing resource: {repr(name)}, type: {repr(ty)}\n"
+                    + f"ValueError has risen: {e}"
+                ) from e
+            except AssertionError as e:
+                raise AssertionError(
+                    f"While processing resource: {repr(name)}, type {repr(ty)}\n"
+                    + f"AssertionError has risen: {e}"
+                ) from e
             log.debug(f"resource registration prepared: ty={ty}, name={name}")
+
+            callbacks: List[callback_pb2.Callback] = []
+            if opts.transforms:
+                if not _sync_monitor_supports_transforms():
+                    raise Exception(
+                        "The Pulumi CLI does not support transforms. Please update the Pulumi CLI."
+                    )
+                callback_server = await _get_callbacks()
+                if callback_server is None:
+                    raise Exception("Callback server not initialized")
+                for transform in opts.transforms:
+                    callbacks.append(callback_server.register_transform(transform))
 
             property_dependencies = {}
             for key, deps in resolver.property_dependencies.items():
-                property_dependencies[
-                    key
-                ] = resource_pb2.RegisterResourceRequest.PropertyDependencies(urns=deps)
+                property_dependencies[key] = (
+                    resource_pb2.RegisterResourceRequest.PropertyDependencies(urns=deps)
+                )
 
             ignore_changes = _translate_ignore_changes(res, typ, opts.ignore_changes)
             additional_secret_outputs = _translate_additional_secret_outputs(
@@ -828,27 +982,7 @@ def register_resource(
             # Translate the CustomTimeouts object.
             custom_timeouts = None
             if opts.custom_timeouts is not None:
-                custom_timeouts = resource_pb2.RegisterResourceRequest.CustomTimeouts()
-                # It could be an actual CustomTimeouts object.
-                if known_types.is_custom_timeouts(opts.custom_timeouts):
-                    if opts.custom_timeouts.create is not None:
-                        custom_timeouts.create = opts.custom_timeouts.create
-                    if opts.custom_timeouts.update is not None:
-                        custom_timeouts.update = opts.custom_timeouts.update
-                    if opts.custom_timeouts.delete is not None:
-                        custom_timeouts.delete = opts.custom_timeouts.delete
-                # Or, it could be a workaround passing in a dict.
-                elif isinstance(opts.custom_timeouts, dict):
-                    if "create" in opts.custom_timeouts:
-                        custom_timeouts.create = opts.custom_timeouts["create"]
-                    if "update" in opts.custom_timeouts:
-                        custom_timeouts.update = opts.custom_timeouts["update"]
-                    if "delete" in opts.custom_timeouts:
-                        custom_timeouts.delete = opts.custom_timeouts["delete"]
-                else:
-                    raise Exception(
-                        "Expected custom_timeouts to be a CustomTimeouts object"
-                    )
+                custom_timeouts = _create_custom_timeouts(opts.custom_timeouts)
 
             if (
                 resolver.deleted_with_urn
@@ -858,13 +992,12 @@ def register_resource(
                     "The Pulumi CLI does not support the DeletedWith option. Please update the Pulumi CLI."
                 )
 
-            accept_resources = not (
-                os.getenv("PULUMI_DISABLE_RESOURCE_REFERENCES", "").upper()
-                in {"TRUE", "1"}
-            )
+            accept_resources = os.getenv(
+                "PULUMI_DISABLE_RESOURCE_REFERENCES", ""
+            ).upper() not in {"TRUE", "1"}
 
-            full_aliases_specs: List[alias_pb2.Alias] | None = None
-            alias_urns: List[str] | None = None
+            full_aliases_specs: Optional[List[alias_pb2.Alias]] = None
+            alias_urns: Optional[List[str]] = None
             if resolver.supports_alias_specs:
                 full_aliases_specs = resolver.aliases
             else:
@@ -898,6 +1031,10 @@ def register_resource(
                 replaceOnChanges=replace_on_changes or [],
                 retainOnDelete=opts.retain_on_delete or False,
                 deletedWith=resolver.deleted_with_urn or "",
+                sourcePosition=source_position,
+                transforms=callbacks,
+                supportsResultReporting=True,
+                packageRef=package_ref_str or "",
             )
 
             mock_urn = await create_urn(name, ty, resolver.parent_urn).future()
@@ -908,7 +1045,7 @@ def register_resource(
                 if monitor is None:
                     # If no monitor is available, we'll need to fake up a response, for testing.
                     return RegisterResponse(
-                        mock_urn or "", None, resolver.serialized_props, None
+                        mock_urn or "", None, resolver.serialized_props, None, None
                     )
 
                 # If there is a monitor available, make the true RPC request to the engine.
@@ -964,13 +1101,16 @@ def register_resource(
                     urns = list(v.urns)
                     property_deps[k] = set(map(new_dependency, urns))
 
+            keep_unknowns = resp.result == resource_pb2.Result.SUCCESS
             rpc.resolve_outputs(
                 res,
                 resolver.serialized_props,
                 resp.object,
                 property_deps,
                 resolvers,
+                custom,
                 transform_using_type_metadata,
+                keep_unknowns,
             )
             resolve_outputs_called = True
 
@@ -988,7 +1128,7 @@ def register_resource(
 
             raise
 
-    asyncio.ensure_future(RPC_MANAGER.do_rpc("register resource", do_register)())
+    asyncio.ensure_future(_get_rpc_manager().do_rpc("register resource", do_register)())
 
 
 def register_resource_outputs(
@@ -1024,7 +1164,9 @@ def register_resource_outputs(
         )
 
     asyncio.ensure_future(
-        RPC_MANAGER.do_rpc("register resource outputs", do_register_resource_outputs)()
+        _get_rpc_manager().do_rpc(
+            "register resource outputs", do_register_resource_outputs
+        )()
     )
 
 
@@ -1040,19 +1182,21 @@ class RegisterResponse:
     id: Optional[str]
     object: struct_pb2.Struct
     propertyDependencies: Optional[Dict[str, PropertyDependencies]]
+    result: Optional[resource_pb2.Result.ValueType]
 
-    # pylint: disable=redefined-builtin
     def __init__(
         self,
         urn: str,
         id: Optional[str],
         object: struct_pb2.Struct,
         propertyDependencies: Optional[Dict[str, PropertyDependencies]],
+        result: Optional[resource_pb2.Result.ValueType],
     ):
         self.urn = urn
         self.id = id
         self.object = object
         self.propertyDependencies = propertyDependencies
+        self.result = result
 
 
 def convert_providers(
@@ -1080,94 +1224,11 @@ def convert_providers(
     return result
 
 
-async def _add_dependency(
-    deps: Set[str], res: "Resource", from_resource: Optional["Resource"]
-):
+def _pkg_from_type(ty: str) -> Optional[str]:
     """
-    _add_dependency adds a dependency on the given resource to the set of deps.
-
-    The behavior of this method depends on whether or not the resource is a custom resource, a local component resource,
-    or a remote component resource:
-
-    - Custom resources are added directly to the set, as they are "real" nodes in the dependency graph.
-    - Local component resources act as aggregations of their descendents. Rather than adding the component resource
-      itself, each child resource is added as a dependency.
-    - Remote component resources are added directly to the set, as they naturally act as aggregations of their children
-      with respect to dependencies: the construction of a remote component always waits on the construction of its
-      children.
-
-    In other words, if we had:
-
-                     Comp1
-                 |     |     |
-             Cust1   Comp2  Remote1
-                     |   |       |
-                 Cust2   Cust3  Comp3
-                 |                 |
-             Cust4                Cust5
-
-    Then the transitively reachable resources of Comp1 will be [Cust1, Cust2, Cust3, Remote1].
-    It will *not* include:
-    * Cust4 because it is a child of a custom resource
-    * Comp2 because it is a non-remote component resoruce
-    * Comp3 and Cust5 because Comp3 is a child of a remote component resource
+    Extract the pkg from the type token of the form "pkg:module:member".
     """
-
-    from .. import ComponentResource  # pylint: disable=import-outside-toplevel
-
-    if isinstance(res, ComponentResource) and not res._remote:
-        # Copy the set before iterating so that any concurrent child additions during
-        # the dependency computation (which is async, so can be interleaved with other
-        # operations including child resource construction which adds children to this
-        # resource) do not trigger modification during iteration errors.
-        child_resources = res._childResources.copy()
-        for child in child_resources:
-            await _add_dependency(deps, child, from_resource)
-        return
-
-    no_cycles = declare_dependency(from_resource, res) if from_resource else True
-    if no_cycles:
-        urn = await res.urn.future()
-        if urn:
-            deps.add(urn)
-
-
-async def _expand_dependencies(
-    deps: Iterable["Resource"], from_resource: Optional["Resource"]
-) -> Set[str]:
-    """
-    _expand_dependencies expands the given iterable of Resources into a set of URNs.
-    """
-
-    urns: Set[str] = set()
-    for d in deps:
-        await _add_dependency(urns, d, from_resource)
-
-    return urns
-
-
-async def _resolve_depends_on_urns(
-    options: "ResourceOptions", from_resource: "Resource"
-) -> Set[str]:
-    """
-    Resolves the set of all dependent resources implied by
-    `depends_on`, either directly listed or implied in the Input
-    layer. Returns a deduplicated URN list.
-    """
-
-    if options.depends_on is None:
-        return set()
-
-    outer = Output._from_input_shallow(options._depends_on_list())
-    all_deps = await outer.resources()
-    inner_list = await outer.future() or []
-
-    for i in inner_list:
-        inner = Output.from_input(i)
-        more_deps = await inner.resources()
-        all_deps = all_deps | more_deps
-        direct_dep = await inner.future()
-        if direct_dep is not None:
-            all_deps.add(direct_dep)
-
-    return await _expand_dependencies(all_deps, from_resource)
+    parts = ty.split(":")
+    if len(parts) != 3:
+        return None
+    return parts[0]

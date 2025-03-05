@@ -80,13 +80,13 @@ func UnmarshalVersionedCheckpointToLatestCheckpoint(m encoding.Marshaler, bytes 
 }
 
 func MarshalUntypedDeploymentToVersionedCheckpoint(
-	stack tokens.Name, deployment *apitype.UntypedDeployment) (*apitype.VersionedCheckpoint, error) {
-
+	stack tokens.QName, deployment *apitype.UntypedDeployment,
+) (*apitype.VersionedCheckpoint, error) {
 	chk := struct {
 		Stack  tokens.QName
 		Latest json.RawMessage
 	}{
-		Stack:  stack.Q(),
+		Stack:  stack,
 		Latest: deployment.Deployment,
 	}
 
@@ -102,12 +102,14 @@ func MarshalUntypedDeploymentToVersionedCheckpoint(
 }
 
 // SerializeCheckpoint turns a snapshot into a data structure suitable for serialization.
-func SerializeCheckpoint(stack tokens.Name, snap *deploy.Snapshot,
-	sm secrets.Manager, showSecrets bool) (*apitype.VersionedCheckpoint, error) {
+func SerializeCheckpoint(stack tokens.QName, snap *deploy.Snapshot,
+	showSecrets bool,
+) (*apitype.VersionedCheckpoint, error) {
 	// If snap is nil, that's okay, we will just create an empty deployment; otherwise, serialize the whole snapshot.
 	var latest *apitype.DeploymentV3
 	if snap != nil {
-		dep, err := SerializeDeployment(snap, sm, showSecrets)
+		ctx := context.TODO()
+		dep, err := SerializeDeployment(ctx, snap, showSecrets)
 		if err != nil {
 			return nil, fmt.Errorf("serializing deployment: %w", err)
 		}
@@ -115,7 +117,7 @@ func SerializeCheckpoint(stack tokens.Name, snap *deploy.Snapshot,
 	}
 
 	b, err := encoding.JSON.Marshal(apitype.CheckpointV3{
-		Stack:  stack.Q(),
+		Stack:  stack,
 		Latest: latest,
 	})
 	if err != nil {
@@ -133,8 +135,9 @@ func SerializeCheckpoint(stack tokens.Name, snap *deploy.Snapshot,
 func DeserializeCheckpoint(
 	ctx context.Context,
 	secretsProvider secrets.Provider,
-	chkpoint *apitype.CheckpointV3) (*deploy.Snapshot, error) {
-	contract.Require(chkpoint != nil, "chkpoint")
+	chkpoint *apitype.CheckpointV3,
+) (*deploy.Snapshot, error) {
+	contract.Requiref(chkpoint != nil, "chkpoint", "must not be nil")
 	if chkpoint.Latest != nil {
 		return DeserializeDeploymentV3(ctx, *chkpoint.Latest, secretsProvider)
 	}
@@ -146,10 +149,19 @@ func DeserializeCheckpoint(
 func GetRootStackResource(snap *deploy.Snapshot) (*resource.State, error) {
 	if snap != nil {
 		for _, res := range snap.Resources {
-			if res.Type == resource.RootStackType {
+			if res.Type == resource.RootStackType && res.Parent == "" {
 				return res, nil
 			}
 		}
 	}
 	return nil, nil
+}
+
+// CreateRootStackResource creates a new root stack resource with the given name
+func CreateRootStackResource(stackName tokens.QName, projectName tokens.PackageName) *resource.State {
+	typ, name := resource.RootStackType, fmt.Sprintf("%s-%s", projectName, stackName)
+	urn := resource.NewURN(stackName, projectName, "", typ, name)
+	state := resource.NewState(typ, urn, false, false, "", resource.PropertyMap{}, nil, "", false, false, nil, nil, "",
+		nil, false, nil, nil, nil, "", false, "", nil, nil, "", nil)
+	return state
 }

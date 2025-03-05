@@ -23,6 +23,7 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/convert"
@@ -195,7 +196,7 @@ func (x hclExpression) Variables() []hcl.Traversal {
 		}
 		return n, nil
 	})
-	contract.Assert(len(diags) == 0)
+	contract.Assertf(len(diags) == 0, "unexpected diagnostics: %v", diags)
 	return variables
 }
 
@@ -388,7 +389,8 @@ func (x *BinaryOpExpression) Typecheck(typecheckOperands bool) hcl.Diagnostics {
 
 	// Compute the signature for the operator and typecheck the arguments.
 	signature := getOperationSignature(x.Operation)
-	contract.Assert(len(signature.Parameters) == 2)
+	contract.Assertf(len(signature.Parameters) == 2,
+		"expected binary operator signature to have two parameters, got %v", len(signature.Parameters))
 
 	x.leftType = signature.Parameters[0].Type
 	x.rightType = signature.Parameters[1].Type
@@ -724,6 +726,11 @@ type ForExpression struct {
 	// True if the value expression is being grouped.
 	Group bool
 
+	// Whether the collection type should be strictly type-checked
+	// When true, unsupported collection types will result in an error
+	// otherwise a warning will be emitted
+	StrictCollectionTypechecking bool
+
 	exprType Type
 }
 
@@ -759,10 +766,7 @@ func (x *ForExpression) typecheck(typecheckCollection, typecheckOperands bool) h
 	}
 
 	if typecheckCollection {
-		// Poke through any eventual and optional types that may wrap the collection type.
-		collectionType := unwrapIterableSourceType(x.Collection.Type())
-
-		keyType, valueType, kvDiags := GetCollectionTypes(collectionType, rng)
+		keyType, valueType, kvDiags := GetCollectionTypes(x.Collection.Type(), rng, x.StrictCollectionTypechecking)
 		diagnostics = append(diagnostics, kvDiags...)
 
 		if x.KeyVariable != nil {
@@ -1148,6 +1152,10 @@ type IndexExpression struct {
 	Collection Expression
 	// The index key.
 	Key Expression
+	// Whether the collection type should be strictly type-checked
+	// When true, unsupported collection types will result in an error
+	// otherwise a warning will be emitted
+	StrictCollectionTypechecking bool
 
 	keyType  Type
 	exprType Type
@@ -1192,8 +1200,7 @@ func (x *IndexExpression) Typecheck(typecheckOperands bool) hcl.Diagnostics {
 		rng = x.Syntax.Collection.Range()
 	}
 
-	collectionType := unwrapIterableSourceType(x.Collection.Type())
-	keyType, valueType, kvDiags := GetCollectionTypes(collectionType, rng)
+	keyType, valueType, kvDiags := GetCollectionTypes(x.Collection.Type(), rng, x.StrictCollectionTypechecking)
 	diagnostics = append(diagnostics, kvDiags...)
 	x.keyType = keyType
 
@@ -1288,7 +1295,7 @@ func literalText(value cty.Value, rawBytes []byte, escaped, quoted bool) string 
 		bf := value.AsBigFloat()
 		i, acc := bf.Int64()
 		if acc == big.Exact {
-			return fmt.Sprintf("%v", i)
+			return strconv.FormatInt(i, 10)
 		}
 		d, _ := bf.Float64()
 		return fmt.Sprintf("%g", d)
@@ -1313,7 +1320,7 @@ func escapeString(s string) string {
 
 	// Escape `${`
 	runes := []rune(s)
-	out := make([]rune, 0, len(runes))
+	out := slice.Prealloc[rune](len(runes))
 	for i, r := range runes {
 		next := func() rune {
 			if i >= len(runes)-1 {
@@ -1509,7 +1516,7 @@ func (x *ObjectConsExpression) WithType(updateType func(Type) *ObjectConsExpress
 func (x *ObjectConsExpression) Typecheck(typecheckOperands bool) hcl.Diagnostics {
 	var diagnostics hcl.Diagnostics
 
-	keys := make([]Expression, 0, len(x.Items))
+	keys := slice.Prealloc[Expression](len(x.Items))
 	for _, item := range x.Items {
 		if typecheckOperands {
 			keyDiags := item.Key.Typecheck(true)
@@ -2147,8 +2154,8 @@ func (x *SplatExpression) GetTrailingTrivia() syntax.TriviaList {
 	if parens := x.Tokens.GetParentheses(); parens.Any() {
 		return parens.GetTrailingTrivia()
 	}
-	if close := x.Tokens.GetClose(); close != nil {
-		return close.TrailingTrivia
+	if closeTok := x.Tokens.GetClose(); closeTok != nil {
+		return closeTok.TrailingTrivia
 	}
 	return x.Tokens.GetStar().TrailingTrivia
 }
@@ -2559,7 +2566,8 @@ func (x *UnaryOpExpression) Typecheck(typecheckOperands bool) hcl.Diagnostics {
 
 	// Compute the signature for the operator and typecheck the arguments.
 	signature := getOperationSignature(x.Operation)
-	contract.Assert(len(signature.Parameters) == 1)
+	contract.Assertf(len(signature.Parameters) == 1,
+		"expected unary operator signature to have 1 parameter, got %d", len(signature.Parameters))
 
 	x.operandType = signature.Parameters[0].Type
 

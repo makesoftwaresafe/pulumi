@@ -14,22 +14,33 @@
 
 package deepcopy
 
-import "reflect"
+import (
+	"reflect"
+
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
+	"github.com/pulumi/pulumi/sdk/v3/go/internal"
+)
 
 // Copy returns a deep copy of the provided value.
 //
 // If there are multiple references to the same value inside the provided value, the multiply-referenced value will be
 // copied multiple times.
+//
+// NOTE: Unexported members of structs will *not* be copied.
 func Copy(i interface{}) interface{} {
 	if i == nil {
 		return nil
 	}
-	return copy(reflect.ValueOf(i)).Interface()
+	return deepCopy(reflect.ValueOf(i)).Interface()
 }
 
-func copy(v reflect.Value) reflect.Value {
+func deepCopy(v reflect.Value) reflect.Value {
 	if !v.IsValid() {
 		return v
+	}
+
+	if v.Type() == reflect.TypeOf(internal.OutputState{}) {
+		contract.Failf("Outputs cannot be deep copied")
 	}
 
 	typ := v.Type()
@@ -49,14 +60,14 @@ func copy(v reflect.Value) reflect.Value {
 	case reflect.Interface:
 		rv := reflect.New(typ).Elem()
 		if !v.IsNil() {
-			rv.Set(copy(v.Elem()))
+			rv.Set(deepCopy(v.Elem()))
 		}
 		return rv
 	case reflect.Ptr:
 		if v.IsNil() {
 			return reflect.New(typ).Elem()
 		}
-		elem := copy(v.Elem())
+		elem := deepCopy(v.Elem())
 		if elem.CanAddr() {
 			return elem.Addr()
 		}
@@ -66,7 +77,7 @@ func copy(v reflect.Value) reflect.Value {
 	case reflect.Array:
 		rv := reflect.New(typ).Elem()
 		for i := 0; i < v.Len(); i++ {
-			rv.Index(i).Set(copy(v.Index(i)))
+			rv.Index(i).Set(deepCopy(v.Index(i)))
 		}
 		return rv
 	case reflect.Slice:
@@ -74,7 +85,7 @@ func copy(v reflect.Value) reflect.Value {
 		if !v.IsNil() {
 			rv.Set(reflect.MakeSlice(typ, v.Len(), v.Cap()))
 			for i := 0; i < v.Len(); i++ {
-				rv.Index(i).Set(copy(v.Index(i)))
+				rv.Index(i).Set(deepCopy(v.Index(i)))
 			}
 		}
 		return rv
@@ -84,7 +95,7 @@ func copy(v reflect.Value) reflect.Value {
 			rv.Set(reflect.MakeMap(typ))
 			iter := v.MapRange()
 			for iter.Next() {
-				rv.SetMapIndex(copy(iter.Key()), copy(iter.Value()))
+				rv.SetMapIndex(deepCopy(iter.Key()), deepCopy(iter.Value()))
 			}
 		}
 		return rv
@@ -92,10 +103,12 @@ func copy(v reflect.Value) reflect.Value {
 		rv := reflect.New(typ).Elem()
 		for i := 0; i < typ.NumField(); i++ {
 			if f := rv.Field(i); f.CanSet() {
-				f.Set(copy(v.Field(i)))
+				f.Set(deepCopy(v.Field(i)))
 			}
 		}
 		return rv
+	case reflect.Invalid, reflect.UnsafePointer:
+		panic("unexpected kind " + typ.Kind().String())
 	default:
 		panic("unexpected kind " + typ.Kind().String())
 	}

@@ -38,6 +38,13 @@ func ExpectNoChanges() Option {
 	})
 }
 
+// ClearPendingCreates will cause the refresh to drop all pending creates from the state
+func ClearPendingCreates() Option {
+	return optionFunc(func(opts *Options) {
+		opts.ClearPendingCreates = true
+	})
+}
+
 // Message (optional) to associate with the refresh operation
 func Message(message string) Option {
 	return optionFunc(func(opts *Options) {
@@ -87,10 +94,45 @@ func UserAgent(agent string) Option {
 	})
 }
 
+// Color allows specifying whether to colorize output. Choices are: always, never, raw, auto (default "auto")
+func Color(color string) Option {
+	return optionFunc(func(opts *Options) {
+		opts.Color = color
+	})
+}
+
 // ShowSecrets configures whether to show config secrets when they appear in the config.
 func ShowSecrets(show bool) Option {
 	return optionFunc(func(opts *Options) {
 		opts.ShowSecrets = &show
+	})
+}
+
+// Suppress display of periodic progress dots
+func SuppressProgress() Option {
+	return optionFunc(func(opts *Options) {
+		opts.SuppressProgress = true
+	})
+}
+
+// Suppress display of stack outputs (in case they contain sensitive values)
+func SuppressOutputs() Option {
+	return optionFunc(func(opts *Options) {
+		opts.SuppressOutputs = true
+	})
+}
+
+// Display operation as a rich diff showing the overall change.
+func Diff() Option {
+	return optionFunc(func(o *Options) {
+		o.Diff = true
+	})
+}
+
+// ConfigFile specifies a file to use for configuration values rather than detecting the file name
+func ConfigFile(path string) Option {
+	return optionFunc(func(opts *Options) {
+		opts.ConfigFile = path
 	})
 }
 
@@ -110,7 +152,9 @@ type Options struct {
 	Message string
 	// Return an error if any changes occur during this preview
 	ExpectNoChanges bool
-	// Specify an exclusive list of resource URNs to re
+	// Clear all pending creates, dropping them from the state
+	ClearPendingCreates bool
+	// Specify an exclusive of resource URNs to refresh
 	Target []string
 	// ProgressStreams allows specifying one or more io.Writers to redirect incremental refresh stdout
 	ProgressStreams []io.Writer
@@ -126,6 +170,14 @@ type Options struct {
 	Color string
 	// Show config secrets when they appear.
 	ShowSecrets *bool
+	// Suppress display of periodic progress dots
+	SuppressProgress bool
+	// Suppress display of stack outputs (in case they contain sensitive values)
+	SuppressOutputs bool
+	// Run using the configuration values in the specified file rather than detecting the file name
+	ConfigFile string
+	// When set, display operation as a rich diff showing the overall change
+	Diff bool
 }
 
 type optionFunc func(*Options)

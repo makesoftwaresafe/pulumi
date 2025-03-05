@@ -1,4 +1,4 @@
-// Copyright 2016-2022, Pulumi Corporation.
+// Copyright 2016-2024, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,7 +26,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/pulumi/pulumi/sdk/v3/go/common/tools"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/fsutil"
 	"github.com/stretchr/testify/assert"
 )
@@ -42,9 +41,11 @@ const (
 type Environment struct {
 	*testing.T
 
+	// HomePath is the PULUMI_HOME directory for the environment
+	HomePath string
 	// RootPath is a new temp directory where the environment starts.
 	RootPath string
-	// Current working directory.
+	// Current working directory, defaults to the root path.
 	CWD string
 	// Backend to use for commands
 	Backend string
@@ -54,7 +55,8 @@ type Environment struct {
 	Passphrase string
 	// Set to true to turn off setting PULUMI_CONFIG_PASSPHRASE.
 	NoPassphrase bool
-
+	// Set to true to use the local Pulumi dev build from ~/.pulumi-dev/bin/pulumi which get from `make install`
+	UseLocalPulumiBuild bool
 	// Content to pass on stdin, if any
 	Stdin io.Reader
 }
@@ -69,22 +71,7 @@ func WriteYarnRCForTest(root string) error {
 	// https://github.com/yarnpkg/yarn/issues/4563 as well
 	return os.WriteFile(
 		filepath.Join(root, ".yarnrc"),
-		[]byte("--mutex network\n--network-concurrency 1\n"), 0600)
-}
-
-// NewGoEnvironment returns a new Environment object, located in a GOPATH temp directory.
-func NewGoEnvironment(t *testing.T) *Environment {
-	testRoot, err := tools.CreateTemporaryGoFolder("test-env")
-	if err != nil {
-		t.Errorf("error creating test directory %s", err)
-	}
-
-	t.Logf("Created new go test environment")
-	return &Environment{
-		T:        t,
-		RootPath: testRoot,
-		CWD:      testRoot,
-	}
+		[]byte("--mutex network\n--network-concurrency 1\n"), 0o600)
 }
 
 // NewEnvironment returns a new Environment object, located in a temp directory.
@@ -93,9 +80,14 @@ func NewEnvironment(t *testing.T) *Environment {
 	assert.NoError(t, err, "creating temp directory")
 	assert.NoError(t, WriteYarnRCForTest(root), "writing .yarnrc file")
 
+	// We always use a clean PULUMI_HOME for each environment to avoid any potential conflicts with plugins or config.
+	home, err := os.MkdirTemp("", "test-env-home")
+	assert.NoError(t, err, "creating temp PULUMI_HOME directory")
+
 	t.Logf("Created new test environment:  %v", root)
 	return &Environment{
 		T:        t,
+		HomePath: home,
 		RootPath: root,
 		CWD:      root,
 	}
@@ -119,7 +111,7 @@ func (e *Environment) SetEnvVars(env ...string) {
 
 // ImportDirectory copies a folder into the test environment.
 func (e *Environment) ImportDirectory(path string) {
-	err := fsutil.CopyFile(e.RootPath, path, nil)
+	err := fsutil.CopyFile(e.CWD, path, nil)
 	if err != nil {
 		e.T.Fatalf("error importing directory: %v", err)
 	}
@@ -129,7 +121,12 @@ func (e *Environment) ImportDirectory(path string) {
 func (e *Environment) DeleteEnvironment() {
 	e.Helper()
 	err := os.RemoveAll(e.RootPath)
-	assert.NoErrorf(e, err, "cleaning up test directory %q", e.RootPath)
+	if err != nil {
+		// In CI, Windows sometimes lags behind in marking a resource
+		// as unused. This causes otherwise passing tests to fail.
+		// So ignore errors during cleanup.
+		e.Logf("error cleaning up test directory %q: %v", e.RootPath, err)
+	}
 }
 
 // DeleteEnvironment deletes the environment's RootPath, and everything
@@ -163,6 +160,18 @@ func (e *Environment) RunCommand(cmd string, args ...string) (string, string) {
 		YarnInstallMutex.Lock()
 		defer YarnInstallMutex.Unlock()
 	}
+
+	if e.UseLocalPulumiBuild {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			e.Logf("Run Error: %v", err)
+			e.Fatalf("Ran command %v args %v and expected success. Instead got failure.", cmd, args)
+		}
+		if home != "" {
+			cmd = filepath.Join(home, ".pulumi-dev", "bin", "pulumi")
+		}
+	}
+
 	e.Helper()
 	stdout, stderr, err := e.GetCommandResults(cmd, args...)
 	if err != nil {
@@ -195,12 +204,31 @@ func (e *Environment) LocalURL() string {
 // GetCommandResults runs the given command and args in the Environments CWD, returning
 // STDOUT, STDERR, and the result of os/exec.Command{}.Run.
 func (e *Environment) GetCommandResults(command string, args ...string) (string, string, error) {
+	return e.GetCommandResultsIn(e.CWD, command, args...)
+}
+
+// GetCommandResultsIn runs the given command and args in the given directory, returning
+// STDOUT, STDERR, and the result of os/exec.Command{}.Run.
+func (e *Environment) GetCommandResultsIn(dir string, command string, args ...string) (string, string, error) {
 	e.T.Helper()
 	e.T.Logf("Running command %v %v", command, strings.Join(args, " "))
+
+	cmd := e.SetupCommandIn(dir, command, args...)
 
 	// Buffer STDOUT and STDERR so we can return them later.
 	var outBuffer bytes.Buffer
 	var errBuffer bytes.Buffer
+	cmd.Stdout = &outBuffer
+	cmd.Stderr = &errBuffer
+
+	runErr := cmd.Run()
+	return outBuffer.String(), errBuffer.String(), runErr
+}
+
+// SetupCommandIn creates a new exec.Cmd that's ready to run in the given
+// directory, with the given command and args.
+func (e *Environment) SetupCommandIn(dir string, command string, args ...string) *exec.Cmd {
+	e.T.Helper()
 
 	passphrase := "correct horse battery staple"
 	if e.Passphrase != "" {
@@ -209,20 +237,19 @@ func (e *Environment) GetCommandResults(command string, args ...string) (string,
 
 	//nolint:gas
 	cmd := exec.Command(command, args...)
-	cmd.Dir = e.CWD
+	cmd.Dir = dir
 	if e.Stdin != nil {
 		cmd.Stdin = e.Stdin
 	}
-	cmd.Stdout = &outBuffer
-	cmd.Stderr = &errBuffer
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", pulumiCredentialsPathEnvVar, e.RootPath))
 	cmd.Env = append(cmd.Env, "PULUMI_DEBUG_COMMANDS=true")
+	cmd.Env = append(cmd.Env, "PULUMI_HOME="+e.HomePath)
 	if !e.NoPassphrase {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("PULUMI_CONFIG_PASSPHRASE=%s", passphrase))
+		cmd.Env = append(cmd.Env, "PULUMI_CONFIG_PASSPHRASE="+passphrase)
 	}
 	if e.Backend != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("PULUMI_BACKEND_URL=%s", e.Backend))
+		cmd.Env = append(cmd.Env, "PULUMI_BACKEND_URL="+e.Backend)
 	}
 	// According to https://pkg.go.dev/os/exec#Cmd.Env:
 	//     If Env contains duplicate environment keys, only the last
@@ -230,8 +257,7 @@ func (e *Environment) GetCommandResults(command string, args ...string) (string,
 	// By putting `append e.Env` last, we allow our users to override variables we include.
 	cmd.Env = append(cmd.Env, e.Env...)
 
-	runErr := cmd.Run()
-	return outBuffer.String(), errBuffer.String(), runErr
+	return cmd
 }
 
 // WriteTestFile writes a new test file relative to the Environment's CWD with the given contents.
@@ -244,7 +270,7 @@ func (e *Environment) WriteTestFile(filename string, contents string) {
 		e.T.Fatalf("error making directories for test file (%v): %v", filename, err)
 	}
 
-	if err := os.WriteFile(filename, []byte(contents), os.ModePerm); err != nil {
+	if err := os.WriteFile(filename, []byte(contents), 0o600); err != nil {
 		e.T.Fatalf("writing test file (%v): %v", filename, err)
 	}
 }

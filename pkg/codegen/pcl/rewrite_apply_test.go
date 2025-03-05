@@ -1,3 +1,17 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package pcl
 
 import (
@@ -153,8 +167,9 @@ func TestApplyRewriter(t *testing.T) {
 		Name:         "resourcesOutput",
 		VariableType: model.NewOutputType(model.NewListType(resourceType)),
 	})
-	scope.DefineFunction("element", pulumiBuiltins["element"])
-	scope.DefineFunction("toJSON", pulumiBuiltins["toJSON"])
+	functions := pulumiBuiltins(bindOptions{})
+	scope.DefineFunction("element", functions["element"])
+	scope.DefineFunction("toJSON", functions["toJSON"])
 	scope.DefineFunction("getPromise", model.NewFunction(model.StaticFunctionSignature{
 		Parameters: []model.Parameter{{
 			Name: "p",
@@ -182,4 +197,35 @@ func TestApplyRewriter(t *testing.T) {
 			assert.Equal(t, c.output, fmt.Sprintf("%v", expr))
 		})
 	}
+
+	t.Run("skip rewriting applies with toJSON", func(t *testing.T) {
+		input := `toJSON({
+	Version = "2012-10-17"
+	Statement = [{
+		Effect = "Allow"
+		Principal = "*"
+		Action = [ "s3:GetObject" ]
+		Resource = [ "arn:aws:s3:::${resource.id}/*" ]
+	}]
+})`
+		expectedOutput := `toJSON({
+	Version = "2012-10-17"
+	Statement = [{
+		Effect = "Allow"
+		Principal = "*"
+		Action = [ "s3:GetObject" ]
+		Resource = [
+                __apply(resource.id,eval(id,  "arn:aws:s3:::${id}/*")) ]
+	}]
+})`
+
+		expr, diags := model.BindExpressionText(input, scope, hcl.Pos{})
+		assert.Len(t, diags, 0)
+
+		expr, diags = RewriteAppliesWithSkipToJSON(expr, nameInfo(0), false, true /* skiToJson */)
+		assert.Len(t, diags, 0)
+
+		output := fmt.Sprintf("%v", expr)
+		assert.Equal(t, expectedOutput, output)
+	})
 }

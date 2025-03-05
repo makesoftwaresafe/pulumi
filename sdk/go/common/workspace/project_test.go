@@ -1,3 +1,17 @@
+// Copyright 2018-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package workspace
 
 import (
@@ -7,9 +21,12 @@ import (
 	"os"
 	"testing"
 
+	"github.com/pulumi/esc"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/encoding"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 )
 
@@ -51,13 +68,11 @@ func TestProjectValidationForNameAndRuntime(t *testing.T) {
 	// Test lack of name
 	proj := Project{}
 	err = proj.Validate()
-	assert.Error(t, err)
-	assert.Equal(t, "project is missing a 'name' attribute", err.Error())
+	assert.EqualError(t, err, "project is missing a 'name' attribute")
 	// Test lack of runtime
 	proj.Name = "a project"
 	err = proj.Validate()
-	assert.Error(t, err)
-	assert.Equal(t, "project is missing a 'runtime' attribute", err.Error())
+	assert.EqualError(t, err, "project is missing a 'runtime' attribute")
 
 	// Test success
 	proj.Runtime = NewProjectRuntimeInfo("test", nil)
@@ -78,8 +93,7 @@ func TestProjectValidationFailsForIncorrectDefaultValueType(t *testing.T) {
 
 	project.Config = invalidConfig
 	err := project.Validate()
-	assert.Contains(t,
-		err.Error(),
+	assert.ErrorContains(t, err,
 		"The default value specified for configuration key 'instanceSize' is not of the expected type 'integer'")
 
 	invalidValues := make([]interface{}, 0)
@@ -101,9 +115,7 @@ func TestProjectValidationFailsForIncorrectDefaultValueType(t *testing.T) {
 	}
 	project.Config = invalidConfigWithArray
 	err = project.Validate()
-	assert.Error(t, err, "There is a validation error")
-	assert.Contains(t,
-		err.Error(),
+	assert.ErrorContains(t, err,
 		"The default value specified for configuration key 'values' is not of the expected type 'array<array<string>>'")
 }
 
@@ -149,67 +161,242 @@ func TestProjectValidationSucceedsForCorrectDefaultValueType(t *testing.T) {
 	assert.NoError(t, err, "There should be no validation error")
 }
 
+func writeAndLoad(t *testing.T, str string) (*Project, error) {
+	tmp, err := os.CreateTemp("", "*.json")
+	assert.NoError(t, err)
+	path := tmp.Name()
+	err = os.WriteFile(path, []byte(str), 0o600)
+	assert.NoError(t, err)
+	return LoadProject(path)
+}
+
 func TestProjectLoadJSON(t *testing.T) {
 	t.Parallel()
 
-	writeAndLoad := func(str string) (*Project, error) {
-		tmp, err := os.CreateTemp("", "*.json")
-		assert.NoError(t, err)
-		path := tmp.Name()
-		err = os.WriteFile(path, []byte(str), 0600)
-		assert.NoError(t, err)
-		return LoadProject(path)
-	}
-
 	// Test wrong type
-	_, err := writeAndLoad("\"hello  \"")
-	assert.Contains(t, err.Error(), "expected project to be an object, was 'string'")
+	t.Run("wrong type", func(t *testing.T) {
+		t.Parallel()
 
-	// Test lack of name
-	_, err = writeAndLoad("{}")
-	assert.Contains(t, err.Error(), "project is missing a 'name' attribute")
+		// Act.
+		_, err := writeAndLoad(t, "\"hello  \"")
 
-	// Test bad name
-	_, err = writeAndLoad("{\"name\": \"\"}")
-	assert.Contains(t, err.Error(), "project is missing a non-empty string 'name' attribute")
+		// Assert.
+		assert.ErrorContains(t, err, "expected project to be an object, was 'string'")
+	})
 
-	// Test missing runtime
-	_, err = writeAndLoad("{\"name\": \"project\"}")
-	assert.Contains(t, err.Error(), "project is missing a 'runtime' attribute")
+	t.Run("missing name attribute", func(t *testing.T) {
+		t.Parallel()
 
-	// Test other schema errors
-	_, err = writeAndLoad("{\"name\": \"project\", \"runtime\": 4}")
-	// These can vary in order, so contains not equals check
-	expected := []string{
-		"3 errors occurred:",
-		"* #/runtime: oneOf failed",
-		"* #/runtime: expected string, but got number",
-		"* #/runtime: expected object, but got number"}
-	for _, e := range expected {
-		assert.Contains(t, err.Error(), e)
-	}
+		// Act.
+		_, err := writeAndLoad(t, "{}")
 
-	_, err = writeAndLoad("{\"name\": \"project\", \"runtime\": \"test\", \"backend\": 4, \"main\": {}}")
-	expected = []string{
-		"2 errors occurred:",
-		"* #/main: expected string or null, but got object",
-		"* #/backend: expected object or null, but got number"}
-	for _, e := range expected {
-		assert.Contains(t, err.Error(), e)
-	}
+		// Assert.
+		assert.ErrorContains(t, err, "project is missing a 'name' attribute")
+	})
 
-	// Test success
-	proj, err := writeAndLoad("{\"name\": \"project\", \"runtime\": \"test\"}")
-	assert.NoError(t, err)
-	assert.Equal(t, tokens.PackageName("project"), proj.Name)
-	assert.Equal(t, "test", proj.Runtime.Name())
+	t.Run("bad name", func(t *testing.T) {
+		t.Parallel()
 
-	// Test null optionals should work
-	proj, err = writeAndLoad("{\"name\": \"project\", \"runtime\": \"test\", " +
-		"\"description\": null, \"main\": null, \"backend\": null}")
-	assert.NoError(t, err)
-	assert.Nil(t, proj.Description)
-	assert.Equal(t, "", proj.Main)
+		// Act.
+		_, err := writeAndLoad(t, "{\"name\": \"\"}")
+
+		// Assert.
+		assert.ErrorContains(t, err, "project is missing a non-empty string 'name' attribute")
+	})
+
+	t.Run("missing runtime", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		_, err := writeAndLoad(t, "{\"name\": \"project\"}")
+
+		// Assert.
+		assert.ErrorContains(t, err, "project is missing a 'runtime' attribute")
+	})
+
+	t.Run("multiple errors 1", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		_, err := writeAndLoad(t, "{\"name\": \"project\", \"runtime\": 4}")
+
+		// Assert.
+		// The order can vary here, so we use Contains and not Equals.
+		expected := []string{
+			"3 errors occurred:",
+			"* #/runtime: oneOf failed",
+			"* #/runtime: expected string, but got number",
+			"* #/runtime: expected object, but got number",
+		}
+
+		for _, e := range expected {
+			assert.ErrorContains(t, err, e)
+		}
+	})
+
+	t.Run("multiple errors, 2", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		_, err := writeAndLoad(t, "{\"name\": \"project\", \"runtime\": \"test\", \"backend\": 4, \"main\": {}}")
+
+		// Assert.
+		// The order can vary here, so we use Contains and not Equals.
+		expected := []string{
+			"2 errors occurred:",
+			"* #/main: expected string or null, but got object",
+			"* #/backend: expected object or null, but got number",
+		}
+
+		for _, e := range expected {
+			assert.ErrorContains(t, err, e)
+		}
+	})
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		proj, err := writeAndLoad(t, "{\"name\": \"project\", \"runtime\": \"test\"}")
+
+		// Assert.
+		assert.NoError(t, err)
+		assert.Equal(t, tokens.PackageName("project"), proj.Name)
+		assert.Equal(t, "test", proj.Runtime.Name())
+	})
+
+	t.Run("null optionals should work", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		proj, err := writeAndLoad(t, "{\"name\": \"project\", \"runtime\": \"test\", "+
+			"\"description\": null, \"main\": null, \"backend\": null}")
+
+		// Assert.
+		assert.NoError(t, err)
+		assert.Nil(t, proj.Description)
+		assert.Equal(t, "", proj.Main)
+	})
+}
+
+func TestProjectLoadJSONInformativeErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a missing name attribute", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		_, err := writeAndLoad(t, `{"Name": "project", "runtime": "test"}`)
+
+		// Assert.
+		assert.ErrorContains(t, err, "project is missing a 'name' attribute")
+		assert.ErrorContains(t, err, "found 'Name' instead")
+	})
+
+	t.Run("a missing runtime attribute", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		_, err := writeAndLoad(t, `{"name": "project", "rutnime": "test"}`)
+
+		// Assert.
+		assert.ErrorContains(t, err, "project is missing a 'runtime' attribute")
+		assert.ErrorContains(t, err, "found 'rutnime' instead")
+	})
+
+	t.Run("a minor spelling mistake in a schema field", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		_, err := writeAndLoad(t, `{
+  "name": "project",
+  "runtime": "test",
+  "template": {
+    "displatName": "foo"
+  }
+}`)
+
+		// Assert.
+		assert.ErrorContains(t, err, "'displatName' not allowed; did you mean 'displayName'?")
+	})
+
+	t.Run("a major spelling mistake in a schema field", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		_, err := writeAndLoad(t, `{
+  "name": "project",
+  "runtime": "test",
+  "template": {
+    "displayNameDisplayName": "foo"
+  }
+}`)
+
+		// Assert.
+		assert.ErrorContains(t, err, "'displayNameDisplayName' not allowed")
+		assert.ErrorContains(t, err, "'displayNameDisplayName' not allowed; the allowed attributes are "+
+			"'config', 'description', 'displayName', 'important', 'metadata' and 'quickstart'")
+	})
+
+	t.Run("specific errors when only a single attribute is expected", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		_, err := writeAndLoad(t, `{
+  "name": "project",
+  "runtime": "test",
+  "backend": {
+    "url": "https://pulumi.com",
+    "name": "test"
+  }
+}`)
+
+		// Assert.
+		assert.ErrorContains(t, err, "'name' not allowed")
+		assert.ErrorContains(t, err, "'name' not allowed; the only allowed attribute is 'url'")
+	})
+
+	t.Run("a minor spelling mistake even deeper in the schema", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		_, err := writeAndLoad(t, `{
+  "name": "project",
+  "runtime": "test",
+  "plugins": {
+    "providers": [
+      {
+        "nome": "test"
+      }
+    ]
+  }
+}`)
+
+		// Assert.
+		assert.ErrorContains(t, err, "'nome' not allowed; did you mean 'name'")
+	})
+
+	t.Run("a major spelling mistake even deeper in the schema", func(t *testing.T) {
+		t.Parallel()
+
+		// Act.
+		_, err := writeAndLoad(t, `{
+  "name": "project",
+  "runtime": "test",
+  "plugins": {
+    "providers": [
+      {
+        "displayName": "test"
+      }
+    ]
+  }
+}`)
+
+		// Assert.
+		assert.ErrorContains(t, err, "'displayName' not allowed")
+		assert.ErrorContains(t, err, "'displayName' not allowed; the allowed attributes are "+
+			"'name', 'path' and 'version'")
+	})
 }
 
 func deleteFile(t *testing.T, file *os.File) {
@@ -223,7 +410,7 @@ func loadProjectFromText(t *testing.T, content string) (*Project, error) {
 	tmp, err := os.CreateTemp("", "*.yaml")
 	assert.NoError(t, err)
 	path := tmp.Name()
-	err = os.WriteFile(path, []byte(content), 0600)
+	err = os.WriteFile(path, []byte(content), 0o600)
 	assert.NoError(t, err)
 	defer deleteFile(t, tmp)
 	return LoadProject(path)
@@ -233,7 +420,17 @@ func loadProjectStackFromText(t *testing.T, project *Project, content string) (*
 	tmp, err := os.CreateTemp("", "*.yaml")
 	assert.NoError(t, err)
 	path := tmp.Name()
-	err = os.WriteFile(path, []byte(content), 0600)
+	err = os.WriteFile(path, []byte(content), 0o600)
+	assert.NoError(t, err)
+	defer deleteFile(t, tmp)
+	return LoadProjectStack(project, path)
+}
+
+func loadProjectStackFromJSONText(t *testing.T, project *Project, content string) (*ProjectStack, error) {
+	tmp, err := os.CreateTemp("", "*.json")
+	assert.NoError(t, err)
+	path := tmp.Name()
+	err = os.WriteFile(path, []byte(content), 0o600)
 	assert.NoError(t, err)
 	defer deleteFile(t, tmp)
 	return LoadProjectStack(project, path)
@@ -388,7 +585,14 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
 	assert.NoError(t, configError, "Config override should be valid")
 
 	assert.Equal(t, 3, len(stack.Config), "Stack config now has three values")
@@ -417,7 +621,14 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
 	assert.NoError(t, configError, "Config override should be valid")
 	assert.Equal(t, 3, len(stack.Config), "Stack config now has three values")
 	// value of instanceSize is overwritten from the stack
@@ -445,7 +656,14 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
 	assert.NoError(t, configError, "Config override should be valid")
 
 	assert.Equal(t, 2, len(stack.Config), "Stack config now has three values")
@@ -473,7 +691,14 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
 	assert.NoError(t, configError, "Config override should be valid")
 	assert.Equal(t, 2, len(stack.Config), "Stack config now has three values")
 	// value of instanceSize is overwritten from the stack
@@ -489,7 +714,7 @@ runtime: dotnet
 config:
   instanceSize:
     default: t3.micro
-  region: 
+  region:
     value: us-west-1`
 
 	projectStackYaml := `
@@ -500,7 +725,14 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
 	assert.NoError(t, configError, "Config override should be valid")
 	assert.Equal(t, 3, len(stack.Config), "Stack config now has three values")
 	// value of instanceSize is overwritten from the stack
@@ -525,7 +757,14 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
 	assert.NoError(t, configError, "Config override should be valid")
 	assert.Equal(t, 2, len(stack.Config), "Stack config now has three values")
 	// value of instanceSize is overwritten from the stack
@@ -545,7 +784,7 @@ config:
       region: us-west-1`
 
 	_, projectError := loadProjectFromText(t, projectYaml)
-	assert.Contains(t, projectError.Error(),
+	assert.ErrorContains(t, projectError,
 		"Configuration key 'aws:region' is not namespaced by the project and should not define a type")
 }
 
@@ -561,7 +800,7 @@ config:
     value: t4.large`
 
 	_, projectError := loadProjectFromText(t, projectYaml)
-	assert.Contains(t, projectError.Error(),
+	assert.ErrorContains(t, projectError,
 		"project config 'instanceSize' cannot have both a 'default' and 'value' attribute")
 }
 
@@ -576,7 +815,7 @@ config:
     default: [t3.micro, t4.large]`
 
 	_, projectError := loadProjectFromText(t, projectYaml)
-	assert.Contains(t, projectError.Error(),
+	assert.ErrorContains(t, projectError,
 		"The configuration key 'instanceSize' declares an array "+
 			"but does not specify the underlying type via the 'items' attribute")
 }
@@ -591,9 +830,9 @@ config:
     default: us-west-1`
 
 	_, projectError := loadProjectFromText(t, projectYaml)
-	assert.Contains(t, projectError.Error(),
+	assert.ErrorContains(t, projectError,
 		"Configuration key 'aws:region' is not namespaced by the project and should not define a default value")
-	assert.Contains(t, projectError.Error(),
+	assert.ErrorContains(t, projectError,
 		"Did you mean to use the 'value' attribute instead of 'default'?")
 }
 
@@ -618,7 +857,14 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
 	assert.NoError(t, configError, "Config override should be valid")
 	assert.Equal(t, 3, len(stack.Config), "Stack config now has three values")
 	// value of instanceSize is overwritten from the stack
@@ -648,9 +894,15 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
-	assert.NotNil(t, configError, "there should be a config type error")
-	assert.Contains(t, configError.Error(), "Stack 'dev' with configuration key 'values' must be of type 'array<string>'")
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
+	assert.ErrorContains(t, configError, "Stack 'dev' with configuration key 'values' must be of type 'array<string>'")
 }
 
 func TestLoadingConfigIsRewrittenToStackConfigDir(t *testing.T) {
@@ -676,8 +928,7 @@ stackConfigDir: ./some/other/path`
 
 	project, projectError := loadProjectFromText(t, projectYaml)
 	assert.Nil(t, project, "Should NOT be able to load the project")
-	assert.NotNil(t, projectError, "There is a project error")
-	assert.Contains(t, projectError.Error(), "Should not use both config and stackConfigDir")
+	assert.ErrorContains(t, projectError, "Should not use both config and stackConfigDir")
 }
 
 func TestConfigObjectAndStackConfigDirSuccessfullyLoadProject(t *testing.T) {
@@ -717,20 +968,32 @@ config:
   test:importantNumber: hello
 `
 
+	ctx := context.Background()
 	project, projectError := loadProjectFromText(t, projectYaml)
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYamlValid)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		ctx,
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
 	assert.NoError(t, configError, "there should no config type error")
 
 	invalidStackConfig, stackError := loadProjectStackFromText(t, project, projectStackYamlInvalid)
 	assert.NoError(t, stackError, "Should be able to read the stack")
 	configError = ValidateStackConfigAndApplyProjectConfig(
-		"dev", project, invalidStackConfig.Config, config.NewPanicCrypter())
-	assert.NotNil(t, configError, "there should be a config type error")
-	assert.Contains(t,
-		configError.Error(),
+		ctx,
+		"dev",
+		project,
+		esc.Value{},
+		invalidStackConfig.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
+	assert.ErrorContains(t, configError,
 		"Stack 'dev' with configuration key 'importantNumber' must be of type 'integer'")
 }
 
@@ -751,9 +1014,15 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
-	assert.NotNil(t, configError, "there should be a config type error")
-	assert.Contains(t, configError.Error(), "Stack 'dev' is missing configuration value 'values'")
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
+	assert.ErrorContains(t, configError, "Stack 'dev' is missing configuration value 'values'")
 }
 
 func TestStackConfigErrorsWhenMissingTwoStackValueForConfigTypeWithNoDefault(t *testing.T) {
@@ -775,9 +1044,15 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
-	assert.NotNil(t, configError, "there should be a config type error")
-	assert.Contains(t, configError.Error(), "Stack 'dev' is missing configuration values 'another' and 'values'")
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
+	assert.ErrorContains(t, configError, "Stack 'dev' is missing configuration values 'another' and 'values'")
 }
 
 func TestStackConfigErrorsWhenMissingMultipleStackValueForConfigTypeWithNoDefault(t *testing.T) {
@@ -801,9 +1076,15 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
-	assert.NotNil(t, configError, "there should be a config type error")
-	assert.Contains(t, configError.Error(), "Stack 'dev' is missing configuration values 'hello', 'values' and 'world'")
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
+	assert.ErrorContains(t, configError, "Stack 'dev' is missing configuration values 'hello', 'values' and 'world'")
 }
 
 func TestStackConfigDoesNotErrorWhenProjectHasNotDefinedConfig(t *testing.T) {
@@ -822,7 +1103,14 @@ config:
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, config.NewPanicCrypter())
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
 	assert.Nil(t, configError, "there should not be a config type error")
 }
 
@@ -852,20 +1140,102 @@ config:
   test:importantNumber: 20
 `
 
+	ctx := context.Background()
 	project, projectError := loadProjectFromText(t, projectYaml)
 	assert.NoError(t, projectError, "Shold be able to load the project")
 	stack, stackError := loadProjectStackFromText(t, project, projectStackYamlValid)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError := ValidateStackConfigAndApplyProjectConfig("dev", project, stack.Config, crypter)
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		ctx,
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		crypter,
+		crypter)
 	assert.NoError(t, configError, "there should no config type error")
 
 	invalidStackConfig, stackError := loadProjectStackFromText(t, project, projectStackYamlInvalid)
 	assert.NoError(t, stackError, "Should be able to read the stack")
-	configError = ValidateStackConfigAndApplyProjectConfig("dev", project, invalidStackConfig.Config, crypter)
-	assert.NotNil(t, configError, "there should be a config type error")
-	assert.Contains(t,
-		configError.Error(),
+	configError = ValidateStackConfigAndApplyProjectConfig(
+		ctx,
+		"dev",
+		project,
+		esc.Value{},
+		invalidStackConfig.Config,
+		crypter,
+		crypter)
+	assert.ErrorContains(t, configError,
 		"Stack 'dev' with configuration key 'importantNumber' must be encrypted as it's secret")
+}
+
+//nolint:lll
+func TestEnvironmentMerge(t *testing.T) {
+	t.Parallel()
+
+	projectYAML := `
+name: test
+runtime: nodejs`
+
+	stackYAML := `
+config:
+  test:boolean: true
+  test:number: 42
+  test:string: foo
+  test:array:
+    - first
+    - second
+  test:object:
+    foo: bar
+    object:
+      baz: 42`
+
+	env := esc.NewValue(map[string]esc.Value{
+		"test:boolean": esc.NewValue(false),
+		"test:number":  esc.NewValue(json.Number("42")),
+		"test:string":  esc.NewValue("esc"),
+		"test:array":   esc.NewValue([]esc.Value{esc.NewValue("second"), esc.NewValue("first")}),
+		"test:secret":  esc.NewSecret("hunter2"),
+		"test:object": esc.NewValue(map[string]esc.Value{
+			"boolean": esc.NewValue(true),
+			"number":  esc.NewValue(json.Number("42")),
+			"string":  esc.NewValue("esc"),
+			"array":   esc.NewValue([]esc.Value{esc.NewValue("first"), esc.NewValue("second")}),
+			"object":  esc.NewValue(map[string]esc.Value{"foo": esc.NewValue("bar")}),
+			"foo":     esc.NewValue("qux"),
+		}),
+	})
+
+	project, projectError := loadProjectFromText(t, projectYAML)
+	require.NoError(t, projectError, "Shold be able to load the project")
+	stack, stackError := loadProjectStackFromText(t, project, stackYAML)
+	require.NoError(t, stackError, "Should be able to read the stack")
+
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		env,
+		stack.Config,
+		config.Base64Crypter,
+		config.Base64Crypter)
+	require.NoError(t, configError, "there should not be a config type error")
+
+	secureKeys := stack.Config.SecureKeys()
+	assert.Equal(t, []config.Key{config.MustMakeKey("test", "secret")}, secureKeys)
+
+	m, err := stack.Config.Decrypt(config.Base64Crypter)
+	require.NoError(t, err)
+
+	expected := map[config.Key]string{
+		config.MustMakeKey("test", "array"):   "[\"first\",\"second\"]",
+		config.MustMakeKey("test", "boolean"): "true",
+		config.MustMakeKey("test", "number"):  "42",
+		config.MustMakeKey("test", "object"):  "{\"array\":[\"first\",\"second\"],\"boolean\":true,\"foo\":\"bar\",\"number\":42,\"object\":{\"baz\":42,\"foo\":\"bar\"},\"string\":\"esc\"}",
+		config.MustMakeKey("test", "string"):  "foo",
+		config.MustMakeKey("test", "secret"):  "hunter2",
+	}
+	assert.Equal(t, expected, m)
 }
 
 func TestProjectLoadYAML(t *testing.T) {
@@ -873,27 +1243,27 @@ func TestProjectLoadYAML(t *testing.T) {
 
 	// Test wrong type
 	_, err := loadProjectFromText(t, "\"hello\"")
-	assert.Contains(t, err.Error(), "expected project to be an object")
+	assert.ErrorContains(t, err, "expected project to be an object")
 
 	// Test bad key
 	_, err = loadProjectFromText(t, "4: hello")
-	assert.Contains(t, err.Error(), "expected only string keys, got '%!s(int=4)'")
+	assert.ErrorContains(t, err, "expected only string keys, got '%!s(int=4)'")
 
 	// Test nested bad key
 	_, err = loadProjectFromText(t, "hello:\n    6: bad")
-	assert.Contains(t, err.Error(), "project is missing a 'name' attribute")
+	assert.ErrorContains(t, err, "project is missing a 'name' attribute")
 
 	// Test lack of name
 	_, err = loadProjectFromText(t, "{}")
-	assert.Contains(t, err.Error(), "project is missing a 'name' attribute")
+	assert.ErrorContains(t, err, "project is missing a 'name' attribute")
 
 	// Test bad name
 	_, err = loadProjectFromText(t, "name:")
-	assert.Contains(t, err.Error(), "project is missing a non-empty string 'name' attribute")
+	assert.ErrorContains(t, err, "project is missing a non-empty string 'name' attribute")
 
 	// Test missing runtime
 	_, err = loadProjectFromText(t, "name: project")
-	assert.Contains(t, err.Error(), "project is missing a 'runtime' attribute")
+	assert.ErrorContains(t, err, "project is missing a 'runtime' attribute")
 
 	// Test other schema errors
 	_, err = loadProjectFromText(t, "name: project\nruntime: 4")
@@ -902,18 +1272,20 @@ func TestProjectLoadYAML(t *testing.T) {
 		"3 errors occurred:",
 		"* #/runtime: oneOf failed",
 		"* #/runtime: expected string, but got number",
-		"* #/runtime: expected object, but got number"}
+		"* #/runtime: expected object, but got number",
+	}
 	for _, e := range expected {
-		assert.Contains(t, err.Error(), e)
+		assert.ErrorContains(t, err, e)
 	}
 
 	_, err = loadProjectFromText(t, "name: project\nruntime: test\nbackend: 4\nmain: {}")
 	expected = []string{
 		"2 errors occurred:",
 		"* #/main: expected string or null, but got object",
-		"* #/backend: expected object or null, but got number"}
+		"* #/backend: expected object or null, but got number",
+	}
 	for _, e := range expected {
-		assert.Contains(t, err.Error(), e)
+		assert.ErrorContains(t, err, e)
 	}
 
 	// Test success
@@ -927,4 +1299,534 @@ func TestProjectLoadYAML(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Nil(t, proj.Description)
 	assert.Equal(t, "", proj.Main)
+}
+
+func TestProjectSaveLoadRoundtrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		project Project
+	}{
+		{
+			name: "Numeric name",
+			project: Project{
+				Name:    "1234",
+				Runtime: NewProjectRuntimeInfo("python", nil),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmp, err := os.CreateTemp("", "*.yaml")
+			require.NoError(t, err)
+			defer deleteFile(t, tmp)
+
+			path := tmp.Name()
+
+			err = tt.project.Save(path)
+			require.NoError(t, err)
+
+			loadedProject, err := LoadProject(path)
+			require.NoError(t, err)
+			require.NotNil(t, loadedProject)
+
+			// Clear the raw data before we compare
+			loadedProject.raw = nil
+			assert.Equal(t, tt.project, *loadedProject)
+		})
+	}
+}
+
+func TestProjectEditRoundtrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		yaml     string
+		edit     func(*Project)
+		expected string
+	}{
+		{
+			name:     "Change name",
+			yaml:     "name: test\nruntime: python\n",
+			edit:     func(proj *Project) { proj.Name = "new" },
+			expected: "name: new\nruntime: python\n",
+		},
+		{
+			name: "Add runtime option",
+			yaml: "name: test\nruntime: python\n",
+			edit: func(proj *Project) {
+				proj.Runtime = NewProjectRuntimeInfo(
+					proj.Runtime.Name(),
+					map[string]interface{}{
+						"setting": "test",
+					})
+			},
+			expected: "name: test\nruntime:\n  name: python\n  options:\n    setting: test\n",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmp, err := os.CreateTemp("", "*.yaml")
+			require.NoError(t, err)
+			defer deleteFile(t, tmp)
+
+			path := tmp.Name()
+			err = os.WriteFile(path, []byte(tt.yaml), 0o600)
+			require.NoError(t, err)
+
+			loadedProject, err := LoadProject(path)
+			require.NoError(t, err)
+			require.NotNil(t, loadedProject)
+
+			tt.edit(loadedProject)
+			err = loadedProject.Save(path)
+			require.NoError(t, err)
+
+			actualYaml, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.expected, string(actualYaml))
+		})
+	}
+}
+
+func TestEnvironmentAppend(t *testing.T) {
+	t.Parallel()
+
+	t.Run("JSON list", func(t *testing.T) {
+		t.Parallel()
+
+		projectYaml := `name: test
+runtime: yaml`
+
+		projectStackJSON := "{}"
+
+		project, err := loadProjectFromText(t, projectYaml)
+		require.NoError(t, err)
+		stack, err := loadProjectStackFromJSONText(t, project, projectStackJSON)
+		require.NoError(t, err)
+
+		stack.Environment = stack.Environment.Append("env")
+		marshaled, err := encoding.JSON.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, "{\n    \"environment\": [\n        \"env\"\n    ]\n}\n", string(marshaled))
+
+		stack.Environment = stack.Environment.Append("env2")
+		marshaled, err = encoding.JSON.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, "{\n    \"environment\": [\n        \"env\",\n        \"env2\"\n    ]\n}\n", string(marshaled))
+	})
+
+	t.Run("JSON literal", func(t *testing.T) {
+		t.Parallel()
+
+		projectYaml := `name: test
+runtime: yaml`
+
+		projectStackJSON := `{
+    "environment": {
+        "values": {
+            "pulumiConfig": {
+                "aws:region": "us-west-2"
+            }
+        }
+    }
+}
+`
+
+		project, err := loadProjectFromText(t, projectYaml)
+		require.NoError(t, err)
+		stack, err := loadProjectStackFromJSONText(t, project, projectStackJSON)
+		require.NoError(t, err)
+
+		expected := `{
+    "environment": {
+        "imports": [
+            "env"
+        ],
+        "values": {
+            "pulumiConfig": {
+                "aws:region": "us-west-2"
+            }
+        }
+    }
+}
+`
+
+		stack.Environment = stack.Environment.Append("env")
+		marshaled, err := encoding.JSON.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+
+		expected = `{
+    "environment": {
+        "imports": [
+            "env",
+            "env2"
+        ],
+        "values": {
+            "pulumiConfig": {
+                "aws:region": "us-west-2"
+            }
+        }
+    }
+}
+`
+
+		stack.Environment = stack.Environment.Append("env2")
+		marshaled, err = encoding.JSON.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+	})
+
+	t.Run("YAML list", func(t *testing.T) {
+		t.Parallel()
+
+		projectYaml := `name: test
+runtime: yaml`
+
+		projectStackYaml := ""
+
+		project, err := loadProjectFromText(t, projectYaml)
+		require.NoError(t, err)
+		stack, err := loadProjectStackFromText(t, project, projectStackYaml)
+		require.NoError(t, err)
+
+		stack.Environment = stack.Environment.Append("env")
+		marshaled, err := encoding.YAML.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, "environment:\n  - env\n", string(marshaled))
+
+		stack.Environment = stack.Environment.Append("env2")
+		marshaled, err = encoding.YAML.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, "environment:\n  - env\n  - env2\n", string(marshaled))
+	})
+
+	t.Run("YAML literal", func(t *testing.T) {
+		t.Parallel()
+
+		projectYaml := `name: test
+runtime: yaml`
+
+		projectStackYaml := `environment:
+  values:
+    pulumiConfig:
+      aws:region: us-west-2`
+
+		project, err := loadProjectFromText(t, projectYaml)
+		require.NoError(t, err)
+		stack, err := loadProjectStackFromText(t, project, projectStackYaml)
+		require.NoError(t, err)
+
+		expected := `environment:
+  values:
+    pulumiConfig:
+      aws:region: us-west-2
+  imports:
+    - env
+`
+
+		stack.Environment = stack.Environment.Append("env")
+		marshaled, err := encoding.YAML.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+
+		expected = `environment:
+  values:
+    pulumiConfig:
+      aws:region: us-west-2
+  imports:
+    - env
+    - env2
+`
+
+		stack.Environment = stack.Environment.Append("env2")
+		marshaled, err = encoding.YAML.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+	})
+}
+
+func TestEnvironmentRemove(t *testing.T) {
+	t.Parallel()
+
+	t.Run("JSON list", func(t *testing.T) {
+		t.Parallel()
+
+		projectYaml := `name: test
+runtime: yaml`
+
+		projectStackJSON := `{
+    "environment": [
+        "env2",
+        "env",
+        "env2"
+    ]
+}
+`
+
+		project, err := loadProjectFromText(t, projectYaml)
+		require.NoError(t, err)
+		stack, err := loadProjectStackFromJSONText(t, project, projectStackJSON)
+		require.NoError(t, err)
+
+		expected := `{
+    "environment": [
+        "env2",
+        "env"
+    ]
+}
+`
+
+		stack.Environment = stack.Environment.Remove("env2")
+		marshaled, err := encoding.JSON.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+
+		expected = `{
+    "environment": [
+        "env2"
+    ]
+}
+`
+
+		stack.Environment = stack.Environment.Remove("env")
+		marshaled, err = encoding.JSON.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+
+		stack.Environment = stack.Environment.Remove("env2")
+		marshaled, err = encoding.JSON.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, "{}\n", string(marshaled))
+	})
+
+	t.Run("JSON literal", func(t *testing.T) {
+		t.Parallel()
+
+		projectYaml := `name: test
+runtime: yaml`
+
+		projectStackJSON := `{
+    "environment": {
+        "imports": [
+            {
+                "env2": {
+                    "merge": false
+                }
+            },
+            "env",
+            "env2"
+        ],
+        "values": {
+            "pulumiConfig": {
+                "aws:region": "us-west-2"
+            }
+        }
+    }
+}
+`
+
+		project, err := loadProjectFromText(t, projectYaml)
+		require.NoError(t, err)
+		stack, err := loadProjectStackFromJSONText(t, project, projectStackJSON)
+		require.NoError(t, err)
+
+		expected := `{
+    "environment": {
+        "imports": [
+            {
+                "env2": {
+                    "merge": false
+                }
+            },
+            "env"
+        ],
+        "values": {
+            "pulumiConfig": {
+                "aws:region": "us-west-2"
+            }
+        }
+    }
+}
+`
+
+		stack.Environment = stack.Environment.Remove("env2")
+		marshaled, err := encoding.JSON.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+
+		expected = `{
+    "environment": {
+        "imports": [
+            "env"
+        ],
+        "values": {
+            "pulumiConfig": {
+                "aws:region": "us-west-2"
+            }
+        }
+    }
+}
+`
+
+		stack.Environment = stack.Environment.Remove("env2")
+		marshaled, err = encoding.JSON.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+
+		expected = `{
+    "environment": {
+        "imports": [],
+        "values": {
+            "pulumiConfig": {
+                "aws:region": "us-west-2"
+            }
+        }
+    }
+}
+`
+
+		stack.Environment = stack.Environment.Remove("env")
+		marshaled, err = encoding.JSON.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+	})
+
+	t.Run("YAML list", func(t *testing.T) {
+		t.Parallel()
+
+		projectYaml := `name: test
+runtime: yaml`
+
+		projectStackYaml := `environment:
+  - env2
+  - env
+  - env2
+`
+
+		project, err := loadProjectFromText(t, projectYaml)
+		require.NoError(t, err)
+		stack, err := loadProjectStackFromText(t, project, projectStackYaml)
+		require.NoError(t, err)
+
+		expected := `environment:
+  - env2
+  - env
+`
+
+		stack.Environment = stack.Environment.Remove("env2")
+		marshaled, err := encoding.YAML.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+
+		stack.Environment = stack.Environment.Remove("env")
+		marshaled, err = encoding.YAML.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, "environment:\n  - env2\n", string(marshaled))
+
+		stack.Environment = stack.Environment.Remove("env2")
+		marshaled, err = encoding.YAML.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, "{}\n", string(marshaled))
+	})
+
+	t.Run("YAML literal", func(t *testing.T) {
+		t.Parallel()
+
+		projectYaml := `name: test
+runtime: yaml`
+
+		projectStackYaml := `environment:
+  imports:
+    - {env2: {merge: false}}
+    - env
+    - env2
+  values:
+    pulumiConfig:
+      aws:region: us-west-2`
+
+		project, err := loadProjectFromText(t, projectYaml)
+		require.NoError(t, err)
+		stack, err := loadProjectStackFromText(t, project, projectStackYaml)
+		require.NoError(t, err)
+
+		expected := `environment:
+  imports:
+    - {env2: {merge: false}}
+    - env
+  values:
+    pulumiConfig:
+      aws:region: us-west-2
+`
+
+		stack.Environment = stack.Environment.Remove("env2")
+		marshaled, err := encoding.YAML.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+
+		expected = `environment:
+  imports:
+    - env
+  values:
+    pulumiConfig:
+      aws:region: us-west-2
+`
+
+		stack.Environment = stack.Environment.Remove("env2")
+		marshaled, err = encoding.YAML.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+
+		expected = `environment:
+  values:
+    pulumiConfig:
+      aws:region: us-west-2
+`
+
+		stack.Environment = stack.Environment.Remove("env")
+		marshaled, err = encoding.YAML.Marshal(stack)
+		require.NoError(t, err)
+		assert.Equal(t, expected, string(marshaled))
+	})
+}
+
+// Regression test for https://github.com/pulumi/pulumi/issues/18581, check that we handle uint64's in yaml
+func TestStackConfigUInt64(t *testing.T) {
+	t.Parallel()
+	projectYaml := `
+name: test
+runtime: dotnet`
+
+	projectStackYaml := `
+config:
+  test:instanceSize: 18446744073709551615`
+
+	project, projectError := loadProjectFromText(t, projectYaml)
+	assert.NoError(t, projectError, "Shold be able to load the project")
+	stack, stackError := loadProjectStackFromText(t, project, projectStackYaml)
+	assert.NoError(t, stackError, "Should be able to read the stack")
+	configError := ValidateStackConfigAndApplyProjectConfig(
+		context.Background(),
+		"dev",
+		project,
+		esc.Value{},
+		stack.Config,
+		config.NewPanicCrypter(),
+		config.NewPanicCrypter())
+	assert.NoError(t, configError, "Config override should be valid")
+
+	assert.Equal(t, 1, len(stack.Config), "Stack config now has three values")
+	assert.Equal(t, "18446744073709551615", getConfigValue(t, stack.Config, "test:instanceSize"))
 }

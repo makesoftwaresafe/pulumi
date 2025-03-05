@@ -20,6 +20,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 )
 
 const (
@@ -386,12 +388,12 @@ func (o *Object) String() string {
 
 func (o *Object) hash(seen map[Formatter]bool) string {
 	if seen[o] {
-		return fmt.Sprintf("%d", len(seen))
+		return strconv.Itoa(len(seen))
 	}
 	defer func() { seen[o] = false }()
 	seen[o] = true
 	s := "o("
-	keys := make([]string, 0, len(o.Properties))
+	keys := slice.Prealloc[string](len(o.Properties))
 	for key := range o.Properties {
 		keys = append(keys, key)
 	}
@@ -413,7 +415,7 @@ func (o *Object) visit(visiter func(Formatter) func()) {
 	}
 	defer leave()
 	// Check if we can do the whole object in a single line
-	keys := make([]string, 0, len(o.Properties))
+	keys := slice.Prealloc[string](len(o.Properties))
 	for key := range o.Properties {
 		keys = append(keys, key)
 	}
@@ -442,7 +444,7 @@ func (o *Object) string(tg *tagGenerator) string {
 	}
 
 	// Check if we can do the whole object in a single line
-	keys := make([]string, 0, len(o.Properties))
+	keys := slice.Prealloc[string](len(o.Properties))
 	for key := range o.Properties {
 		keys = append(keys, key)
 	}
@@ -520,7 +522,7 @@ func (l *List) String() string {
 
 func (l *List) hash(seen map[Formatter]bool) string {
 	if seen[l] {
-		return fmt.Sprintf("%d", len(seen))
+		return strconv.Itoa(len(seen))
 	}
 	defer func() { seen[l] = false }()
 	seen[l] = true
@@ -600,7 +602,6 @@ func (l *List) string(tg *tagGenerator) string {
 		s += v
 	}
 	return s
-
 }
 
 func (l *List) columns(i int) Formatter {

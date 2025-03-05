@@ -70,7 +70,7 @@ class RPCManager:
             try:
                 result = await rpc
                 exception = None
-            except Exception as exn:
+            except Exception as exn:  # noqa: BLE001 catch blind exception
                 log.debug("RPC failed with exception:")
                 log.debug(traceback.format_exc())
                 if self.unhandled_exception is None:
@@ -88,9 +88,3 @@ class RPCManager:
         self.rpcs = []
         self.exception_traceback = None
         self.unhandled_exception = None
-
-
-RPC_MANAGER: RPCManager = RPCManager()
-"""
-Singleton RPC manager responsible for coordinating RPC calls to the engine.
-"""

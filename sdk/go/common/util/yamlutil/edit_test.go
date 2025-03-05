@@ -70,7 +70,6 @@ listFoo:
 	}, `
 # header
 foo: 1
-baz: quux
 list: ["1", "two", "pi", # test3
   e*2] #test4
 listFoo:
@@ -79,13 +78,13 @@ listFoo:
   - bar: "barTwo" # nestedComment1
     list: ["a", "bee", cee] # nestedComment2
     # trailer
+baz: quux
 
 # footer
 `)
 }
 
 func TestEditEmpty(t *testing.T) {
-
 	// Covers 100% of the happy path statements
 	t.Parallel()
 

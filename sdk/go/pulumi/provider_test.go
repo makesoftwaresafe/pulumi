@@ -19,11 +19,16 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	rarchive "github.com/pulumi/pulumi/sdk/v3/go/common/resource/archive"
+	rasset "github.com/pulumi/pulumi/sdk/v3/go/common/resource/asset"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
+	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 )
 
 type BoolEnumInput interface {
@@ -224,7 +229,7 @@ type NestedMapOutputArgs struct {
 
 type Nested struct {
 	Foo string `pulumi:"foo"`
-	Bar int    `pulumi:"bar"`
+	Bar int    `pulumi:"bar,optional"`
 }
 
 type NestedOutput struct {
@@ -554,20 +559,20 @@ func init() {
 	RegisterInputType(reflect.TypeOf((*StringEnumInput)(nil)).Elem(), StringEnum(""))
 }
 
-func assertOutputEqual(t *testing.T, value interface{}, known bool, secret bool, deps urnSet, output interface{}) {
+func assertOutputEqual(t *testing.T, value interface{}, known bool, secret bool, deps map[URN]struct{}, output interface{}) {
 	actualValue, actualKnown, actualSecret, actualDeps, err := await(output.(Output))
 	assert.NoError(t, err)
 	assert.Equal(t, value, actualValue)
 	assert.Equal(t, known, actualKnown)
 	assert.Equal(t, secret, actualSecret)
 
-	actualDepsSet := urnSet{}
+	actualDepsSet := map[URN]struct{}{}
 	for _, res := range actualDeps {
-		urn, uknown, usecret, err := res.URN().awaitURN(context.TODO())
+		urn, uknown, usecret, err := res.URN().awaitURN(context.Background())
 		assert.NoError(t, err)
 		assert.True(t, uknown)
 		assert.False(t, usecret)
-		actualDepsSet.add(urn)
+		actualDepsSet[urn] = struct{}{}
 	}
 	assert.Equal(t, deps, actualDepsSet)
 }
@@ -582,7 +587,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 	tests := []struct {
 		name          string
 		input         resource.PropertyValue
-		deps          urnSet
+		deps          map[URN]struct{}
 		args          interface{}
 		assert        func(t *testing.T, actual interface{})
 		expectedError string
@@ -640,7 +645,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 		{
 			name:  "string deps",
 			input: resource.NewStringProperty("hello"),
-			deps:  urnSet{"fakeURN": struct{}{}},
+			deps:  map[URN]struct{}{"fakeURN": {}},
 			args:  &StringArgs{},
 			expectedError: "pulumi.StringArgs.Value is typed as string but must be a type that implements " +
 				"pulumi.Input or pulumi.Output for input with dependencies",
@@ -684,7 +689,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			input: resource.MakeSecret(resource.NewStringProperty("hello")),
 			args:  &StringInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
-				assertOutputEqual(t, "hello", true, true, urnSet{}, actual)
+				assertOutputEqual(t, "hello", true, true, map[URN]struct{}{}, actual)
 			},
 		},
 		{
@@ -696,7 +701,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			}),
 			args: &StringInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
-				assertOutputEqual(t, "hello", true, true, urnSet{}, actual)
+				assertOutputEqual(t, "hello", true, true, map[URN]struct{}{}, actual)
 			},
 		},
 		{
@@ -704,7 +709,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			input: resource.NewOutputProperty(resource.Output{}),
 			args:  &StringInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
-				assertOutputEqual(t, nil, false, false, urnSet{}, actual)
+				assertOutputEqual(t, nil, false, false, map[URN]struct{}{}, actual)
 			},
 		},
 		{
@@ -714,16 +719,16 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			}),
 			args: &StringInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
-				assertOutputEqual(t, nil, false, true, urnSet{}, actual)
+				assertOutputEqual(t, nil, false, true, map[URN]struct{}{}, actual)
 			},
 		},
 		{
 			name:  "StringInput with deps",
 			input: resource.NewStringProperty("hello"),
-			deps:  urnSet{"fakeURN": struct{}{}},
+			deps:  map[URN]struct{}{"fakeURN": {}},
 			args:  &StringInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
-				assertOutputEqual(t, "hello", true, false, urnSet{"fakeURN": struct{}{}}, actual)
+				assertOutputEqual(t, "hello", true, false, map[URN]struct{}{"fakeURN": {}}, actual)
 			},
 		},
 
@@ -759,7 +764,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			input: resource.MakeSecret(resource.NewBoolProperty(true)),
 			args:  &BoolInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
-				assertOutputEqual(t, true, true, true, urnSet{}, actual)
+				assertOutputEqual(t, true, true, true, map[URN]struct{}{}, actual)
 			},
 		},
 		{
@@ -771,7 +776,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			}),
 			args: &BoolInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
-				assertOutputEqual(t, true, true, true, urnSet{}, actual)
+				assertOutputEqual(t, true, true, true, map[URN]struct{}{}, actual)
 			},
 		},
 		{
@@ -779,7 +784,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			input: resource.NewOutputProperty(resource.Output{}),
 			args:  &BoolInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
-				assertOutputEqual(t, nil, false, false, urnSet{}, actual)
+				assertOutputEqual(t, nil, false, false, map[URN]struct{}{}, actual)
 			},
 		},
 		{
@@ -789,7 +794,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			}),
 			args: &BoolInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
-				assertOutputEqual(t, nil, false, true, urnSet{}, actual)
+				assertOutputEqual(t, nil, false, true, map[URN]struct{}{}, actual)
 			},
 		},
 
@@ -908,7 +913,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
 				assert.Equal(t, String("hello"), v[0])
-				assertOutputEqual(t, "world", true, true, urnSet{}, v[1])
+				assertOutputEqual(t, "world", true, true, map[URN]struct{}{}, v[1])
 			},
 		},
 
@@ -959,7 +964,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
 				assert.Equal(t, String("hello"), v["foo"])
-				assertOutputEqual(t, "world", true, true, urnSet{}, v["bar"])
+				assertOutputEqual(t, "world", true, true, map[URN]struct{}{}, v["bar"])
 			},
 		},
 		{
@@ -973,14 +978,14 @@ func TestConstructInputsCopyTo(t *testing.T) {
 					Dependencies: []resource.URN{"fakeURN"},
 				}),
 			}),
-			deps: urnSet{"fakeURN": struct{}{}},
+			deps: map[URN]struct{}{"fakeURN": {}},
 			args: &StringMapInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.(StringMap)
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
 				assert.Equal(t, String("hello"), v["foo"])
-				assertOutputEqual(t, "world", true, true, urnSet{"fakeURN": struct{}{}}, v["bar"])
+				assertOutputEqual(t, "world", true, true, map[URN]struct{}{"fakeURN": {}}, v["bar"])
 			},
 		},
 		{
@@ -994,16 +999,16 @@ func TestConstructInputsCopyTo(t *testing.T) {
 					Dependencies: []resource.URN{"fakeURN1", "fakeURN2"},
 				}),
 			}),
-			deps: urnSet{"fakeURN1": struct{}{}},
+			deps: map[URN]struct{}{"fakeURN1": {}},
 			args: &StringMapInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.(StringMap)
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
 				assert.Equal(t, String("hello"), v["foo"])
-				assertOutputEqual(t, "world", true, true, urnSet{
-					"fakeURN1": struct{}{},
-					"fakeURN2": struct{}{},
+				assertOutputEqual(t, "world", true, true, map[URN]struct{}{
+					"fakeURN1": {},
+					"fakeURN2": {},
 				}, v["bar"])
 			},
 		},
@@ -1044,7 +1049,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				"foo": "hello",
 				"bar": 42,
 			})),
-			deps: urnSet{"fakeURN": struct{}{}},
+			deps: map[URN]struct{}{"fakeURN": {}},
 			args: &NestedArgs{},
 			expectedError: "pulumi.NestedArgs.Value is typed as pulumi.Nested but must be a type that implements " +
 				"pulumi.Input or pulumi.Output for input with dependencies",
@@ -1119,7 +1124,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assertOutputEqual(t, Nested{
 					Foo: "hello",
 					Bar: 42,
-				}, true, false, urnSet{}, actual)
+				}, true, false, map[URN]struct{}{}, actual)
 			},
 		},
 
@@ -1135,7 +1140,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assertOutputEqual(t, &Nested{
 					Foo: "world",
 					Bar: 100,
-				}, true, false, urnSet{}, actual)
+				}, true, false, map[URN]struct{}{}, actual)
 			},
 		},
 
@@ -1157,7 +1162,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assertOutputEqual(t, []Nested{
 					{Foo: "a", Bar: 1},
 					{Foo: "b", Bar: 2},
-				}, true, false, urnSet{}, actual)
+				}, true, false, map[URN]struct{}{}, actual)
 			},
 		},
 
@@ -1179,7 +1184,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assertOutputEqual(t, map[string]Nested{
 					"a": {Foo: "c", Bar: 3},
 					"b": {Foo: "d", Bar: 4},
-				}, true, false, urnSet{}, actual)
+				}, true, false, map[URN]struct{}{}, actual)
 			},
 		},
 
@@ -1210,7 +1215,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
 				assert.Equal(t, String("foo"), v[0])
-				assertOutputEqual(t, "bar", true, true, urnSet{}, v[1])
+				assertOutputEqual(t, "bar", true, true, map[URN]struct{}{}, v[1])
 			},
 		},
 		{
@@ -1225,7 +1230,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
 				assert.Equal(t, String("foo"), v[0])
-				assertOutputEqual(t, nil, false, false, urnSet{}, v[1])
+				assertOutputEqual(t, nil, false, false, map[URN]struct{}{}, v[1])
 			},
 		},
 		{
@@ -1261,7 +1266,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
 				assert.Equal(t, String("foo"), v[0])
-				assertOutputEqual(t, "bar", true, true, urnSet{}, v[1])
+				assertOutputEqual(t, "bar", true, true, map[URN]struct{}{}, v[1])
 			},
 		},
 		{
@@ -1270,14 +1275,14 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				resource.NewStringProperty("foo"),
 				resource.NewStringProperty("bar"),
 			}),
-			deps: urnSet{"fakeURN": struct{}{}},
+			deps: map[URN]struct{}{"fakeURN": {}},
 			args: &PlainArrayArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.([]StringInput)
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
-				assertOutputEqual(t, "foo", true, false, urnSet{"fakeURN": struct{}{}}, v[0])
-				assertOutputEqual(t, "bar", true, false, urnSet{"fakeURN": struct{}{}}, v[1])
+				assertOutputEqual(t, "foo", true, false, map[URN]struct{}{"fakeURN": {}}, v[0])
+				assertOutputEqual(t, "bar", true, false, map[URN]struct{}{"fakeURN": {}}, v[1])
 			},
 		},
 
@@ -1308,7 +1313,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
 				assert.Equal(t, String("bar"), v["foo"])
-				assertOutputEqual(t, "qux", true, true, urnSet{}, v["baz"])
+				assertOutputEqual(t, "qux", true, true, map[URN]struct{}{}, v["baz"])
 			},
 		},
 		{
@@ -1323,7 +1328,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
 				assert.Equal(t, String("bar"), v["foo"])
-				assertOutputEqual(t, nil, false, false, urnSet{}, v["baz"])
+				assertOutputEqual(t, nil, false, false, map[URN]struct{}{}, v["baz"])
 			},
 		},
 		{
@@ -1359,7 +1364,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
 				assert.Equal(t, String("bar"), v["foo"])
-				assertOutputEqual(t, "qux", true, true, urnSet{}, v["baz"])
+				assertOutputEqual(t, "qux", true, true, map[URN]struct{}{}, v["baz"])
 			},
 		},
 		{
@@ -1368,14 +1373,14 @@ func TestConstructInputsCopyTo(t *testing.T) {
 				"foo": "bar",
 				"baz": "qux",
 			})),
-			deps: urnSet{"fakeURN": struct{}{}},
+			deps: map[URN]struct{}{"fakeURN": {}},
 			args: &PlainMapArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.(map[string]StringInput)
 				assert.True(t, ok)
 				assert.Len(t, v, 2)
-				assertOutputEqual(t, "bar", true, false, urnSet{"fakeURN": struct{}{}}, v["foo"])
-				assertOutputEqual(t, "qux", true, false, urnSet{"fakeURN": struct{}{}}, v["baz"])
+				assertOutputEqual(t, "bar", true, false, map[URN]struct{}{"fakeURN": {}}, v["foo"])
+				assertOutputEqual(t, "qux", true, false, map[URN]struct{}{"fakeURN": {}}, v["baz"])
 			},
 		},
 
@@ -1409,7 +1414,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.(*NestedInputtyInputArgs)
 				assert.True(t, ok)
-				assertOutputEqual(t, "anything", true, true, urnSet{}, v.Something)
+				assertOutputEqual(t, "anything", true, true, map[URN]struct{}{}, v.Something)
 			},
 		},
 		{
@@ -1421,7 +1426,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.(*NestedInputtyInputArgs)
 				assert.True(t, ok)
-				assertOutputEqual(t, nil, false, false, urnSet{}, v.Something)
+				assertOutputEqual(t, nil, false, false, map[URN]struct{}{}, v.Something)
 			},
 		},
 		{
@@ -1452,7 +1457,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.(*NestedInputtyInputArgs)
 				assert.True(t, ok)
-				assertOutputEqual(t, "anything", true, true, urnSet{}, v.Something)
+				assertOutputEqual(t, "anything", true, true, map[URN]struct{}{}, v.Something)
 			},
 		},
 		{
@@ -1465,12 +1470,12 @@ func TestConstructInputsCopyTo(t *testing.T) {
 					Dependencies: []resource.URN{"fakeURN"},
 				}),
 			}),
-			deps: urnSet{"fakeURN": struct{}{}},
+			deps: map[URN]struct{}{"fakeURN": {}},
 			args: &PlainOptionalNestedInputtyInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.(*NestedInputtyInputArgs)
 				assert.True(t, ok)
-				assertOutputEqual(t, "anything", true, true, urnSet{"fakeURN": struct{}{}}, v.Something)
+				assertOutputEqual(t, "anything", true, true, map[URN]struct{}{"fakeURN": {}}, v.Something)
 			},
 		},
 
@@ -1504,7 +1509,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.(*NestedInputtyArgs)
 				assert.True(t, ok)
-				assertOutputEqual(t, "anything", true, true, urnSet{}, v.Something)
+				assertOutputEqual(t, "anything", true, true, map[URN]struct{}{}, v.Something)
 			},
 		},
 		{
@@ -1516,7 +1521,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.(*NestedInputtyArgs)
 				assert.True(t, ok)
-				assertOutputEqual(t, nil, false, false, urnSet{}, v.Something)
+				assertOutputEqual(t, nil, false, false, map[URN]struct{}{}, v.Something)
 			},
 		},
 		{
@@ -1547,7 +1552,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.(*NestedInputtyArgs)
 				assert.True(t, ok)
-				assertOutputEqual(t, "anything", true, true, urnSet{}, v.Something)
+				assertOutputEqual(t, "anything", true, true, map[URN]struct{}{}, v.Something)
 			},
 		},
 		{
@@ -1560,19 +1565,19 @@ func TestConstructInputsCopyTo(t *testing.T) {
 					Dependencies: []resource.URN{"fakeURN"},
 				}),
 			}),
-			deps: urnSet{"fakeURN": struct{}{}},
+			deps: map[URN]struct{}{"fakeURN": {}},
 			args: &PlainOptionalNestedInputtyArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				v, ok := actual.(*NestedInputtyArgs)
 				assert.True(t, ok)
-				assertOutputEqual(t, "anything", true, true, urnSet{"fakeURN": struct{}{}}, v.Something)
+				assertOutputEqual(t, "anything", true, true, map[URN]struct{}{"fakeURN": {}}, v.Something)
 			},
 		},
 
 		// AssetArgs
 		{
 			name:  "AssetArgs no deps",
-			input: resource.NewAssetProperty(&resource.Asset{Text: "hello"}),
+			input: resource.NewAssetProperty(&rasset.Asset{Text: "hello"}),
 			args:  &AssetArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				assert.Equal(t, NewStringAsset("hello"), actual)
@@ -1582,7 +1587,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 		// AssetInputArgs
 		{
 			name:  "AssetInputArgs no deps",
-			input: resource.NewAssetProperty(&resource.Asset{Text: "hello"}),
+			input: resource.NewAssetProperty(&rasset.Asset{Text: "hello"}),
 			args:  &AssetInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				assert.Equal(t, NewStringAsset("hello"), actual)
@@ -1592,7 +1597,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 		// ArchiveArgs
 		{
 			name:  "ArchiveArgs no deps",
-			input: resource.NewArchiveProperty(&resource.Archive{Path: "path"}),
+			input: resource.NewArchiveProperty(&rarchive.Archive{Path: "path"}),
 			args:  &ArchiveArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				assert.Equal(t, NewFileArchive("path"), actual)
@@ -1602,7 +1607,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 		// ArchiveInputArgs
 		{
 			name:  "ArchiveInputArgs no deps",
-			input: resource.NewArchiveProperty(&resource.Archive{Path: "path"}),
+			input: resource.NewArchiveProperty(&rarchive.Archive{Path: "path"}),
 			args:  &ArchiveInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				assert.Equal(t, NewFileArchive("path"), actual)
@@ -1612,7 +1617,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 		// AssetOrArchiveArgs
 		{
 			name:  "AssetOrArchiveArgs no deps",
-			input: resource.NewAssetProperty(&resource.Asset{Text: "hello"}),
+			input: resource.NewAssetProperty(&rasset.Asset{Text: "hello"}),
 			args:  &AssetOrArchiveArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				assert.Equal(t, NewStringAsset("hello"), actual)
@@ -1622,7 +1627,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 		// AssetOrArchiveInputArgs
 		{
 			name:  "AssetOrArchiveInputArgs no deps",
-			input: resource.NewAssetProperty(&resource.Asset{Text: "hello"}),
+			input: resource.NewAssetProperty(&rasset.Asset{Text: "hello"}),
 			args:  &AssetOrArchiveInputArgs{},
 			assert: func(t *testing.T, actual interface{}) {
 				assert.Equal(t, NewStringAsset("hello"), actual)
@@ -1656,7 +1661,7 @@ func TestConstructInputsCopyTo(t *testing.T) {
 							},
 						},
 					},
-				}, true, false, urnSet{}, actual)
+				}, true, false, map[URN]struct{}{}, actual)
 			},
 		},
 	}
@@ -1735,4 +1740,368 @@ func TestSerdeNilNestedResource(t *testing.T) {
 
 	_, _, _, err = marshalInputs(state)
 	assert.NoError(t, err)
+}
+
+func TestConstruct_resourceOptionsSnapshot(t *testing.T) {
+	t.Parallel()
+
+	// Runs Construct with the given request and a fake constructor,
+	// and returns a snapshot (ResourceOptions) of the resulting options.
+	//
+	// Fails the test if any operation fails.
+	snapshotFromRequest := func(t *testing.T, req *pulumirpc.ConstructRequest) *ResourceOptions {
+		// Keep test cases simple:
+		req.Stack = "mystack"
+		req.Project = "myproject"
+
+		var got *ResourceOptions
+		ctx := context.Background()
+		_, err := construct(ctx, req, nil, func(
+			ctx *Context,
+			typ, name string,
+			inputs map[string]interface{},
+			opts ResourceOption,
+		) (URNInput, Input, error) {
+			urn := resource.NewURN(
+				tokens.QName(ctx.Stack()),
+				tokens.PackageName(ctx.Project()),
+				"", // parent
+				tokens.Type(typ),
+				name,
+			)
+
+			snap, err := NewResourceOptions(opts)
+			require.NoError(t, err, "failed to create snapshot")
+			got = snap
+
+			return URN(urn), nil, nil
+		})
+		require.NoError(t, err, "failed to construct")
+		require.NotNil(t, got, "Construct was never called")
+		return got
+	}
+
+	t.Run("Aliases", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			Aliases: []string{"test"},
+		})
+		assert.Len(t, snap.Aliases, 1, "aliases were not set")
+	})
+
+	t.Run("DependsOn", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			Dependencies: []string{"test"},
+		})
+		assert.Len(t, snap.DependsOn, 1, "dependencies were not set")
+	})
+
+	t.Run("Protect", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			Protect: true,
+		})
+		assert.True(t, snap.Protect, "protect was not set")
+	})
+
+	t.Run("Providers", func(t *testing.T) {
+		t.Parallel()
+
+		urn := resource.NewURN("mystack", "myproject", "", "pulumi:providers:foo", "bar")
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			Providers: map[string]string{
+				"baz": string(urn) + "::qux",
+			},
+		})
+		assert.Len(t, snap.Providers, 1, "providers were not set")
+	})
+
+	t.Run("Parent", func(t *testing.T) {
+		t.Parallel()
+
+		urn := resource.NewURN("mystack", "myproject", "", "pulumi:providers:foo", "bar")
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			Parent: string(urn),
+		})
+		assert.NotNil(t, snap.Parent, "parent was not set")
+	})
+
+	t.Run("AdditionalSecretOutputs", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			AdditionalSecretOutputs: []string{"foo"},
+		})
+		assert.Equal(t, []string{"foo"}, snap.AdditionalSecretOutputs)
+	})
+
+	t.Run("CustomTimeouts", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name string
+			give *pulumirpc.ConstructRequest_CustomTimeouts
+			want *CustomTimeouts
+		}{
+			{
+				name: "Create",
+				give: &pulumirpc.ConstructRequest_CustomTimeouts{Create: "1m"},
+				want: &CustomTimeouts{Create: "1m"},
+			},
+			{
+				name: "Update",
+				give: &pulumirpc.ConstructRequest_CustomTimeouts{Update: "2m"},
+				want: &CustomTimeouts{Update: "2m"},
+			},
+			{
+				name: "Delete",
+				give: &pulumirpc.ConstructRequest_CustomTimeouts{Delete: "3m"},
+				want: &CustomTimeouts{Delete: "3m"},
+			},
+			{
+				name: "all",
+				give: &pulumirpc.ConstructRequest_CustomTimeouts{
+					Create: "1m",
+					Update: "2m",
+					Delete: "3m",
+				},
+				want: &CustomTimeouts{
+					Create: "1m",
+					Update: "2m",
+					Delete: "3m",
+				},
+			},
+		}
+
+		for _, tt := range tests {
+			tt := tt
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+					CustomTimeouts: tt.give,
+				})
+
+				assert.Equal(t, tt.want, snap.CustomTimeouts)
+			})
+		}
+	})
+
+	t.Run("DeletedWith", func(t *testing.T) {
+		t.Parallel()
+
+		urn := resource.NewURN("mystack", "myproject", "", "foo:bar:Baz", "qux")
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			DeletedWith: string(urn),
+		})
+		assert.NotNil(t, snap.DeletedWith, "deletedWith was not set")
+	})
+
+	t.Run("DeleteBeforeReplace", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			DeleteBeforeReplace: true,
+		})
+		assert.True(t, snap.DeleteBeforeReplace, "deleteBeforeReplace was not set")
+	})
+
+	t.Run("IgnoreChanges", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			IgnoreChanges: []string{"foo"},
+		})
+		assert.Equal(t, []string{"foo"}, snap.IgnoreChanges)
+	})
+
+	t.Run("ReplaceOnChanges", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			ReplaceOnChanges: []string{"foo"},
+		})
+		assert.Equal(t, []string{"foo"}, snap.ReplaceOnChanges)
+	})
+
+	t.Run("RetainOnDelete", func(t *testing.T) {
+		t.Parallel()
+
+		snap := snapshotFromRequest(t, &pulumirpc.ConstructRequest{
+			RetainOnDelete: true,
+		})
+		assert.True(t, snap.RetainOnDelete, "retainOnDelete was not set")
+	})
+}
+
+func TestConstruct_await(t *testing.T) {
+	t.Parallel()
+
+	// Runs Construct to initiate some async RPCs and/or to produce some outputs.
+	// Note: a given output may or may not be associated with the Pulumi context, depending on how it's made,
+	// meaning that it may or may not be tracked by the context's waitgroup.
+	constructWithState := func(t *testing.T, req *pulumirpc.ConstructRequest, stateF func(ctx *Context, state Map)) error {
+		// Keep test cases simple:
+		req.Stack = "mystack"
+		req.Project = "myproject"
+
+		ctx := context.Background()
+		_, err := construct(ctx, req, nil, func(
+			ctx *Context,
+			typ, name string,
+			inputs map[string]interface{},
+			opts ResourceOption,
+		) (URNInput, Input, error) {
+			urn := resource.NewURN(
+				tokens.QName(ctx.Stack()),
+				tokens.PackageName(ctx.Project()),
+				"", // parent
+				tokens.Type(typ),
+				name,
+			)
+			state := make(Map)
+			stateF(ctx, state)
+			return URN(urn), state, nil
+		})
+		return err
+	}
+
+	t.Run("outstanding rpc", func(t *testing.T) {
+		t.Parallel()
+
+		err := constructWithState(t, &pulumirpc.ConstructRequest{}, func(ctx *Context, state Map) {
+			// begin an outstanding RPC call that will complete after constructF returns,
+			// and don't emit any output properties to keep it pure.
+			err := ctx.beginRPC()
+			require.NoError(t, err, "failed to begin RPC")
+			go func() {
+				time.Sleep(1 * time.Second)
+				ctx.endRPC(nil)
+			}()
+		})
+		require.NoError(t, err, "failed to construct")
+	})
+
+	t.Run("associated output", func(t *testing.T) {
+		t.Parallel()
+
+		err := constructWithState(t, &pulumirpc.ConstructRequest{}, func(ctx *Context, state Map) {
+			// return an output property, derived from the context, that will complete after constructF returns.
+			a, resolve, reject := ctx.NewOutput()
+			go func() {
+				time.Sleep(1 * time.Second)
+				// verify that the context is still open by making an RPC call.
+				err := ctx.beginRPC()
+				if err != nil {
+					reject(err)
+					return
+				}
+				ctx.endRPC(nil)
+				resolve(42)
+			}()
+			state["a"] = a
+		})
+		require.NoError(t, err, "failed to construct")
+	})
+
+	t.Run("unassociated output", func(t *testing.T) {
+		t.Parallel()
+
+		err := constructWithState(t, &pulumirpc.ConstructRequest{}, func(ctx *Context, state Map) {
+			// return an output property, not derived from the context, that will complete after constructF returns.
+			state["b"] = String("b").ToStringOutput().ApplyT(func(v interface{}) (interface{}, error) {
+				time.Sleep(1 * time.Second)
+				// verify that the context is still open by making an RPC call.
+				err := ctx.beginRPC()
+				if err != nil {
+					return nil, err
+				}
+				ctx.endRPC(nil)
+				return v.(string), nil
+			})
+		})
+		require.NoError(t, err, "failed to construct")
+	})
+}
+
+func TestCall_await(t *testing.T) {
+	t.Parallel()
+
+	// Runs Call to initiate some async RPCs and/or to produce some results.
+	// Note: a given result may or may not be associated with the Pulumi context, depending on how it's made,
+	// meaning that it may or may not be tracked by the context's waitgroup.
+	callWithResult := func(t *testing.T, req *pulumirpc.CallRequest, resultF func(ctx *Context, state Map)) error {
+		// Keep test cases simple:
+		req.Stack = "mystack"
+		req.Project = "myproject"
+
+		ctx := context.Background()
+		_, err := call(ctx, req, nil, func(ctx *Context, tok string, args map[string]interface{}) (Input, []interface{}, error) {
+			result := make(Map)
+			resultF(ctx, result)
+			return result, nil, nil
+		})
+		return err
+	}
+
+	t.Run("outstanding rpc", func(t *testing.T) {
+		t.Parallel()
+
+		err := callWithResult(t, &pulumirpc.CallRequest{}, func(ctx *Context, result Map) {
+			// begin an outstanding RPC call that will complete after callF returns,
+			// and don't emit any output properties to keep it pure.
+			err := ctx.beginRPC()
+			require.NoError(t, err, "failed to begin RPC")
+			go func() {
+				time.Sleep(1 * time.Second)
+				ctx.endRPC(nil)
+			}()
+		})
+		require.NoError(t, err, "failed to call")
+	})
+
+	t.Run("associated output", func(t *testing.T) {
+		t.Parallel()
+
+		err := callWithResult(t, &pulumirpc.CallRequest{}, func(ctx *Context, result Map) {
+			// return an output property, derived from the context, that will complete after callF returns.
+			a, resolve, reject := ctx.NewOutput()
+			go func() {
+				time.Sleep(1 * time.Second)
+				// verify that the context is still open by making an RPC call.
+				err := ctx.beginRPC()
+				if err != nil {
+					reject(err)
+					return
+				}
+				ctx.endRPC(nil)
+				resolve(42)
+			}()
+			result["a"] = a
+		})
+		require.NoError(t, err, "failed to call")
+	})
+
+	t.Run("unassociated output", func(t *testing.T) {
+		t.Parallel()
+
+		err := callWithResult(t, &pulumirpc.CallRequest{}, func(ctx *Context, result Map) {
+			// return an output property, not derived from the context, that will complete after callF returns.
+			result["b"] = String("b").ToStringOutput().ApplyT(func(v interface{}) (interface{}, error) {
+				time.Sleep(1 * time.Second)
+				// verify that the context is still open by making an RPC call.
+				err := ctx.beginRPC()
+				if err != nil {
+					return nil, err
+				}
+				ctx.endRPC(nil)
+				return v.(string), nil
+			})
+		})
+		require.NoError(t, err, "failed to call")
+	})
 }

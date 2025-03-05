@@ -20,6 +20,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
@@ -74,12 +75,21 @@ func (entries JournalEntries) Snap(base *deploy.Snapshot) (*deploy.Snapshot, err
 			case deploy.OpDelete, deploy.OpDeleteReplaced, deploy.OpReadDiscard, deploy.OpDiscardReplaced:
 				doneOps[e.Step.Old()] = true
 			}
+		case JournalEntryOutputs:
+			// We do nothing for outputs, since they don't affect the snapshot.
 		}
 
 		// Now mark resources done as necessary.
 		if e.Kind == JournalEntrySuccess {
 			switch e.Step.Op() {
-			case deploy.OpSame, deploy.OpUpdate:
+			case deploy.OpSame:
+				step, ok := e.Step.(*deploy.SameStep)
+				contract.Assertf(ok, "expected *deploy.SameStep, got %T", e.Step)
+				if !step.IsSkippedCreate() {
+					resources = append(resources, e.Step.New())
+					dones[e.Step.Old()] = true
+				}
+			case deploy.OpUpdate:
 				resources = append(resources, e.Step.New())
 				dones[e.Step.Old()] = true
 			case deploy.OpCreate, deploy.OpCreateReplacement:
@@ -136,16 +146,18 @@ func (entries JournalEntries) Snap(base *deploy.Snapshot) (*deploy.Snapshot, err
 		}
 	}
 
-	// If we have a base snapshot, copy over its secrets manager.
+	// If we have a base snapshot, copy over its secrets manager and metadata.
 	var secretsManager secrets.Manager
+	var metadata deploy.SnapshotMetadata
 	if base != nil {
 		secretsManager = base.SecretsManager
+		metadata = base.Metadata
 	}
 
 	manifest := deploy.Manifest{}
 	manifest.Magic = manifest.NewMagic()
 
-	snap := deploy.NewSnapshot(manifest, secretsManager, resources, operations)
+	snap := deploy.NewSnapshot(manifest, secretsManager, resources, operations, metadata)
 	normSnap, err := snap.NormalizeURNReferences()
 	if err != nil {
 		return snap, err
@@ -160,7 +172,7 @@ type Journal struct {
 	done    chan bool
 }
 
-func (j *Journal) Entries() []JournalEntry {
+func (j *Journal) Entries() JournalEntries {
 	<-j.done
 
 	return j.entries
