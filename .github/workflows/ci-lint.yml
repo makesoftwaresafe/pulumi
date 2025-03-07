@@ -17,98 +17,118 @@ on:
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  GOLANGCI_LINT_VERSION: v1.51
+  GOLANGCI_LINT_VERSION: v1.64.2
 
 jobs:
   golangci:
     name: Lint Go
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
       - name: Set up Go
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ fromJson(inputs.version-set).go }}
+          check-latest: true
+          # golangci-lint-action handles all the caching for Go.
+          cache: false
 
-      # Only the first of the following lint actions
-      # should enable the cache.
-      # The rest should 'skip-cache: true'.
-      # They'll all still be cached,
-      # but only the first one will be responsible
-      # for downloading and uploading the cache.
-      - name: Lint pkg
-        uses: golangci/golangci-lint-action@v3
+      # We leverage the golangci-lint action to install
+      # and maintain the cache,
+      # but we want to run the command ourselves.
+      # The action doesn't have an install-only mode,
+      # so we'll ask it to print its help output instead.
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v4
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
-          working-directory: pkg
-          args: --config ../.golangci.yml ./...
-      - name: Lint sdk
-        uses: golangci/golangci-lint-action@v3
-        with:
-          version: ${{ env.GOLANGCI_LINT_VERSION }}
-          working-directory: sdk
-          args: --config ../.golangci.yml ./...
-          skip-cache: true  # first lint action will handle
-      - name: Lint tests
-        uses: golangci/golangci-lint-action@v3
-        with:
-          version: ${{ env.GOLANGCI_LINT_VERSION }}
-          working-directory: tests
-          args: --config ../.golangci.yml ./...
-          skip-cache: true  # first lint action will handle
+          args: --help
+
+      - name: Run golangci-lint
+        # Print GitHub Actions-friendly output so that errors get marked
+        # in the pull request.
+        run: make lint_golang GOLANGCI_LINT_ARGS=--out-format=colored-line-number
 
   tidy:
     name: go mod tidy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
       - name: Set up Go
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ fromJson(inputs.version-set).go }}
+          check-latest: true
       - name: Run go mod tidy
         run: make tidy
       - name: Fail if go mod not tidy
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error go.mod not tidy"
+            echo "::error Please run 'make tidy'"
+            exit 1
+          fi
+
+  gen:
+    name: Generate Go SDK
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ fromJson(inputs.version-set).go }}
+          check-latest: true
+      - name: Run make gen
+        run: cd sdk/go && make gen
+      - name: Fail if there are changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error Running 'make gen' in sdk/go resulted in changes"
+            echo "::error Please run 'make gen' in sdk/go and commit the changes"
             exit 1
           fi
 
   protobuf-lint:
     name: Lint Protobufs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
       - name: Check Protobufs
         run: |
-          make check-proto
+          make check_proto
 
   sdk-lint:
     name: Lint SDKs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
       - name: Set up Go
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ fromJson(inputs.version-set).go }}
+          check-latest: true
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: sdk/python/uv.lock
       - name: Set up Python ${{ fromJson(inputs.version-set).python }}
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ fromJson(inputs.version-set).python }}
-          cache: pip
-          cache-dependency-path: sdk/python/requirements.txt
       - name: Set up Node ${{ fromJson(inputs.version-set).nodejs }}
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ fromJson(inputs.version-set).nodejs }}
           cache: yarn
@@ -123,7 +143,7 @@ jobs:
       - name: Update path
         run: |
           echo "$RUNNER_TEMP/opt/pulumi/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
       - name: Set Go Dep path
@@ -141,26 +161,15 @@ jobs:
 
   actionlint:
     name: Lint GHA
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
       - name: Set up Go
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ fromJson(inputs.version-set).go }}
+          check-latest: true
       - run: |
           make lint_actions
-
-  linear-history:
-    name: linear-history
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-        with:
-          # This should be the merge commit of the PR or candidate merge commit in the staging branch for `bors`.
-          ref: ${{ inputs.ref }}
-          fetch-depth: 0
-      - name: Check for non-linear history
-        run: ./scripts/git-linear-history-check.sh

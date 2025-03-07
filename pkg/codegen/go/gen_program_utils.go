@@ -1,3 +1,17 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package gen
 
 import (
@@ -59,7 +73,7 @@ func (p *promptToInputArrayHelper) getInputItemType() string {
 // necessary. Because many tasks in Go such as reading a file require extensive error
 // handling, it is much prettier to encapsulate that error handling boilerplate as its
 // own function in the preamble.
-func getHelperMethodIfNeeded(functionName string) (string, bool) {
+func getHelperMethodIfNeeded(functionName string, indent string) (string, bool) {
 	switch functionName {
 	case "readFile":
 		return `func readFileOrPanic(path string) pulumi.StringPtrInput {
@@ -70,18 +84,18 @@ func getHelperMethodIfNeeded(functionName string) (string, bool) {
 				return pulumi.String(string(data))
 			}`, true
 	case "filebase64":
-		return `func filebase64OrPanic(path string) pulumi.StringPtrInput {
+		return `func filebase64OrPanic(path string) string {
 					if fileData, err := os.ReadFile(path); err == nil {
-						return pulumi.String(base64.StdEncoding.EncodeToString(fileData[:]))
+						return base64.StdEncoding.EncodeToString(fileData[:])
 					} else {
 						panic(err.Error())
 					}
 				}`, true
 	case "filebase64sha256":
-		return `func filebase64sha256OrPanic(path string) pulumi.StringPtrInput {
+		return `func filebase64sha256OrPanic(path string) string {
 					if fileData, err := os.ReadFile(path); err == nil {
 						hashedData := sha256.Sum256([]byte(fileData))
-						return pulumi.String(base64.StdEncoding.EncodeToString(hashedData[:]))
+						return base64.StdEncoding.EncodeToString(hashedData[:])
 					} else {
 						panic(err.Error())
 					}
@@ -91,6 +105,18 @@ func getHelperMethodIfNeeded(functionName string) (string, bool) {
 				hash := sha1.Sum([]byte(input))
 				return hex.EncodeToString(hash[:])
 			}`, true
+	case "notImplemented":
+		return fmt.Sprintf(`
+%sfunc notImplemented(message string) pulumi.AnyOutput {
+%s  panic(message)
+%s}`, indent, indent, indent), true
+	case "singleOrNone":
+		return fmt.Sprintf(`%sfunc singleOrNone[T any](elements []T) T {
+%s	if len(elements) != 1 {
+%s		panic(fmt.Errorf("singleOrNone expected input slice to have a single element"))
+%s	}
+%s	return elements[0]
+%s}`, indent, indent, indent, indent, indent, indent), true
 	default:
 		return "", false
 	}

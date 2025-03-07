@@ -15,7 +15,6 @@
 package model
 
 import (
-	"fmt"
 	"strconv"
 
 	"github.com/hashicorp/hcl/v2"
@@ -39,7 +38,7 @@ func NewConstType(typ Type, value cty.Value) *ConstType {
 	return &ConstType{Type: typ, Value: value}
 }
 
-func (t *ConstType) Pretty() pretty.Formatter {
+func (t *ConstType) pretty(seenFormatters map[Type]pretty.Formatter) pretty.Formatter {
 	if t.Value.IsNull() {
 		return pretty.FromString("null")
 	}
@@ -50,11 +49,16 @@ func (t *ConstType) Pretty() pretty.Formatter {
 	case cty.String:
 		return pretty.FromString(strconv.Quote(t.Value.AsString()))
 	case cty.Bool:
-		return pretty.FromString(fmt.Sprintf("%v", t.Value.True()))
+		return pretty.FromString(strconv.FormatBool(t.Value.True()))
 	case cty.Number:
 		return pretty.FromStringer(t.Value.AsBigFloat())
 	}
 	return pretty.FromStringer(t)
+}
+
+func (t *ConstType) Pretty() pretty.Formatter {
+	seenFormatters := map[Type]pretty.Formatter{}
+	return t.pretty(seenFormatters)
 }
 
 // SyntaxNode returns the syntax node for the type. This is always syntax.None.

@@ -1,3 +1,17 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package python
 
 import (
@@ -26,8 +40,8 @@ func isParameterReference(parameters codegen.Set, x model.Expression) bool {
 // Each of these patterns matches an apply that can be handled by `pulumi.Output`'s `__getitem__` or `__getattr__`
 // method. The rewritten expressions will use those methods rather than calling `apply`.
 func (g *generator) parseProxyApply(parameters codegen.Set, args []model.Expression,
-	then model.Expression) (model.Expression, bool) {
-
+	then model.Expression,
+) (model.Expression, bool) {
 	if len(args) != 1 {
 		return nil, false
 	}
@@ -58,7 +72,7 @@ func (g *generator) parseProxyApply(parameters codegen.Set, args []model.Express
 	}
 
 	diags := arg.Typecheck(false)
-	contract.Assert(len(diags) == 0)
+	contract.Assertf(len(diags) == 0, "unexpected diagnostics: %v", diags)
 	return arg, true
 }
 

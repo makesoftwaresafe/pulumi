@@ -54,6 +54,17 @@ type PackageInfo struct {
 
 	// Respect the Pkg.Version field for emitted code.
 	RespectSchemaVersion bool `json:"respectSchemaVersion,omitempty"`
+
+	// If enabled, a pyproject.toml file will be generated.
+	PyProject struct {
+		Enabled bool `json:"enabled,omitempty"`
+	} `json:"pyproject,omitempty"`
+
+	// Specifies what types are used for inputs.
+	// Allowed values are the following:
+	// - "classes": Args classes only
+	// - "classes-and-dicts" (default): TypedDicts side-by-side with Args classes.
+	InputTypes string `json:"inputTypes,omitempty"`
 }
 
 // Importer implements schema.Language for Python.

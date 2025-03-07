@@ -24,6 +24,7 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/model/pretty"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 )
 
 // UnionType represents values that may be any one of a specified set of types.
@@ -107,28 +108,44 @@ func (*UnionType) SyntaxNode() hclsyntax.Node {
 	return syntax.None
 }
 
-func (t *UnionType) Pretty() pretty.Formatter {
-	elements := make([]pretty.Formatter, 0, len(t.ElementTypes))
+func (t *UnionType) pretty(seenFormatters map[Type]pretty.Formatter) pretty.Formatter {
+	elements := slice.Prealloc[pretty.Formatter](len(t.ElementTypes))
 	isOptional := false
+	unionFormatter := &pretty.List{
+		Separator: " | ",
+		Elements:  elements,
+	}
+
+	seenFormatters[t] = unionFormatter
+
 	for _, el := range t.ElementTypes {
 		if el == NoneType {
 			isOptional = true
 			continue
 		}
-		elements = append(elements, el.Pretty())
+		if seenFormatter, ok := seenFormatters[el]; ok {
+			unionFormatter.Elements = append(unionFormatter.Elements, seenFormatter)
+		} else {
+			formatter := el.pretty(seenFormatters)
+			seenFormatters[el] = formatter
+			unionFormatter.Elements = append(unionFormatter.Elements, formatter)
+		}
 	}
-	var v pretty.Formatter = &pretty.List{
-		Separator: " | ",
-		Elements:  elements,
-	}
+
 	if isOptional {
-		v = &pretty.Wrap{
-			Value:           v,
+		return &pretty.Wrap{
+			Value:           seenFormatters[t],
 			Postfix:         "?",
 			PostfixSameline: true,
 		}
 	}
-	return v
+
+	return seenFormatters[t]
+}
+
+func (t *UnionType) Pretty() pretty.Formatter {
+	seenFormatters := map[Type]pretty.Formatter{}
+	return t.pretty(seenFormatters)
 }
 
 // Traverse attempts to traverse the union type with the given traverser. This always fails.
@@ -304,7 +321,7 @@ func (t *UnionType) unifyTo(other Type) (Type, ConversionKind) {
 	switch other := other.(type) {
 	case *UnionType:
 		// If the other type is also a union type, produce a new type that is the union of their elements.
-		elements := make([]Type, 0, len(t.ElementTypes)+len(other.ElementTypes))
+		elements := slice.Prealloc[Type](len(t.ElementTypes) + len(other.ElementTypes))
 		elements = append(elements, t.ElementTypes...)
 		elements = append(elements, other.ElementTypes...)
 		return NewUnionType(elements...), SafeConversion

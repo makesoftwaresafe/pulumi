@@ -35,12 +35,13 @@ run_tests() {
     done
 
     success=true
+    echo "::info Tests successful.. failures refer to test flakes that were successfully re-run."
 }
 
 run_tests "${@}"
 
-echo "::set-output name=TEST_SUCCESS::${success}"
-echo "::set-output name=TEST_RETRIED::${retried}"
+echo "TEST_SUCCESS=${success}" >> "$GITHUB_OUTPUT"
+echo "TEST_RETRIED=${retried}" >> "$GITHUB_OUTPUT"
 
 if ! "${success}"; then
     exit 1

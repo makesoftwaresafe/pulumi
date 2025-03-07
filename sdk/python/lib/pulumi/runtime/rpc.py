@@ -15,46 +15,55 @@
 Support for serializing and deserializing properties going into or flowing
 out of RPC calls.
 """
+
 import asyncio
-from collections import abc
 import functools
 import inspect
 from abc import ABC, abstractmethod
+from collections import abc
+from enum import Enum
+import os
 from typing import (
-    List,
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
+    Iterable,
+    List,
     Mapping,
     Optional,
     Sequence,
     Set,
+    Tuple,
     Union,
-    TYPE_CHECKING,
     cast,
+    get_args,
+    get_origin,
 )
-from enum import Enum
 
+import six
 from google.protobuf import struct_pb2
 from semver import VersionInfo as Version
-import six
-from . import known_types, settings
-from .resource import _expand_dependencies
-from .. import log
-from .. import _types
+
+from .. import _types, log
 from .. import urn as urn_util
+from . import known_types, settings
+from .resource_cycle_breaker import declare_dependency
 
 if TYPE_CHECKING:
-    from ..output import Inputs, Input, Output
-    from ..resource import Resource, CustomResource, ProviderResource
     from ..asset import (
+        AssetArchive,
+        FileArchive,
         FileAsset,
+        RemoteArchive,
         RemoteAsset,
         StringAsset,
-        FileArchive,
-        RemoteArchive,
-        AssetArchive,
     )
+    from ..output import Input, Inputs, Output
+    from ..resource import CustomResource, ProviderResource, Resource
+
+ERROR_ON_DEPENDENCY_CYCLES_VAR = "PULUMI_ERROR_ON_DEPENDENCY_CYCLES"
+"""The name of the environment variable to set to false if you want to disable erroring on dependency cycles."""
 
 UNKNOWN = "04da6b54-80e4-46f7-96ec-b56ff0331ba9"
 """If a value is None, we serialize as UNKNOWN, which tells the engine that it may be computed later."""
@@ -111,9 +120,9 @@ _INT_OR_FLOAT = six.integer_types + (float,)
 # released but the corresponding dist wheel has not been. So, we wrap the import in a try/except to avoid breaking all
 # python programs using a new version.
 try:
-    from google.protobuf.pyext._message import (  # pylint: disable-msg=C0412
+    from google.protobuf.pyext._message import (
         SetAllowOversizeProtos,
-    )  # pylint: disable-msg=E0611
+    )
 
     SetAllowOversizeProtos(True)
 except ImportError:
@@ -121,9 +130,9 @@ except ImportError:
 
 # New versions of protobuf have moved the above import to api_implementation
 try:
-    from google.protobuf.pyext import (
+    from google.protobuf.pyext import (  # type: ignore
         cpp_message,
-    )  # pylint: disable-msg=E0611
+    )
 
     if cpp_message._message is not None:
         cpp_message._message.SetAllowOversizeProtos(True)
@@ -152,9 +161,9 @@ def _get_list_element_type(typ: Optional[type]) -> Optional[type]:
 
     # If typ is a list, get the type for its values, to pass
     # along for each item.
-    origin = _types.get_origin(typ)
+    origin = get_origin(typ)
     if typ is list or origin in [list, List, Sequence, abc.Sequence]:
-        args = _types.get_args(typ)
+        args = get_args(typ)
         if len(args) == 1:
             return args[0]
 
@@ -164,9 +173,11 @@ def _get_list_element_type(typ: Optional[type]) -> Optional[type]:
 async def serialize_properties(
     inputs: "Inputs",
     property_deps: Dict[str, List["Resource"]],
+    resource_obj: Optional["Resource"] = None,
     input_transformer: Optional[Callable[[str], str]] = None,
     typ: Optional[type] = None,
-    keep_output_values: Optional[bool] = None,
+    keep_output_values: bool = False,
+    exclude_resource_refs_from_deps: bool = False,
 ) -> struct_pb2.Struct:
     """
     Serializes an arbitrary Input bag into a Protobuf structure, keeping track of the list
@@ -182,7 +193,22 @@ async def serialize_properties(
 
     :param Dict[str, List[Resource]] property_deps: Dependencies are set here.
 
-    :param input_transfomer: Optional name translator.
+    :param Optional[Resource] resource_obj: Optional resource object to use to provide
+    better error messages.
+
+    :param Optional[Callable[[str], str]] input_transfomer: Optional name translator.
+
+    :param Optional[type] typ: Optional input type to use for name translations rather
+    than using the input_transformer.
+
+    :param bool keep_output_values: If true, output values will be kept (only if the
+    monitor supports output values).
+
+    :param bool exclude_resource_refs_from_deps: If true, resource references will not be
+    added to `property_deps` during serialization (only if the monitor supports resource
+    references). This is useful for remote components (i.e. MLCs) and resource method
+    calls where we want property dependencies to be empty for a property that only
+    contains resource references.
     """
 
     # Default implementation of get_type that always returns None.
@@ -195,9 +221,7 @@ async def serialize_properties(
     if typ is not None:
         py_name_to_pulumi_name = _types.input_type_py_to_pulumi_names(typ)
         types = _types.input_type_types(typ)
-        # pylint: disable=C3001
         translate = lambda k: py_name_to_pulumi_name.get(k) or k
-        # pylint: disable=C3001
         get_type = lambda k: types.get(translate(k))  # type: ignore
 
     struct = struct_pb2.Struct()
@@ -205,9 +229,27 @@ async def serialize_properties(
     for k in inputs:
         v = inputs[k]
         deps: List["Resource"] = []
-        result = await serialize_property(
-            v, deps, input_transformer, get_type(k), keep_output_values
-        )
+        try:
+            result = await serialize_property(
+                v,
+                deps,
+                k,
+                resource_obj,
+                input_transformer,
+                get_type(k),
+                keep_output_values,
+                exclude_resource_refs_from_deps,
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"While processing input: {repr(k)}, type {type(k)}, value {repr(v)}\n"
+                + f"ValueError has risen: {e}"
+            ) from e
+        except AssertionError as e:
+            raise AssertionError(
+                f"While processing input: {repr(k)}, type {type(k)}, value {repr(v)}\n"
+                + f"AssertionError has risen: {e}"
+            ) from e
         # We treat properties that serialize to None as if they don't exist.
         if result is not None:
             # While serializing to a pb struct, we must "translate" all key names to be what the
@@ -219,20 +261,113 @@ async def serialize_properties(
                     log.debug(
                         f"top-level input property translated: {k} -> {translated_name}"
                     )
-            # pylint: disable=unsupported-assignment-operation
             struct[translated_name] = result
             property_deps[translated_name] = deps
 
     return struct
 
 
-# pylint: disable=too-many-return-statements, too-many-branches
+async def _add_dependency(
+    deps: dict[str, "Resource"], res: "Resource", from_resource: Optional["Resource"]
+):
+    """
+    _add_dependency adds a dependency on the given resource to the set of deps.
+
+    The behavior of this method depends on whether or not the resource is a custom resource, a local component resource,
+    or a remote component resource:
+
+    - Custom resources are added directly to the set, as they are "real" nodes in the dependency graph.
+    - Local component resources act as aggregations of their descendents. Rather than adding the component resource
+      itself, each child resource is added as a dependency.
+    - Remote component resources are added directly to the set, as they naturally act as aggregations of their children
+      with respect to dependencies: the construction of a remote component always waits on the construction of its
+      children.
+
+    In other words, if we had:
+
+                     Comp1
+                 |     |     |
+             Cust1   Comp2  Remote1
+                     |   |       |
+                 Cust2   Cust3  Comp3
+                 |                 |
+             Cust4                Cust5
+
+    Then the transitively reachable resources of Comp1 will be [Cust1, Cust2, Cust3, Remote1].
+    It will *not* include:
+    * Cust4 because it is a child of a custom resource
+    * Comp2 because it is a non-remote component resoruce
+    * Comp3 and Cust5 because Comp3 is a child of a remote component resource
+    """
+    from ..resource import Resource
+
+    # Note that a recursive algorithm here would be cleaner, but that results in a
+    # RecursionError with deeply nested hierarchies of ComponentResources.
+    res_list = [(res, from_resource)]
+    while len(res_list) > 0:
+        res, from_resource = res_list.pop(0)
+        if not isinstance(res, Resource):
+            raise TypeError(
+                f"'depends_on' was passed a value {res} that was not a Resource."
+            )
+
+        # Exit early if there are cycles to avoid hangs.
+        no_cycles = declare_dependency(from_resource, res) if from_resource else True
+        if not no_cycles:
+            error_on_cycles = (
+                os.getenv(ERROR_ON_DEPENDENCY_CYCLES_VAR, "true").lower() == "true"
+            )
+            if not error_on_cycles:
+                continue
+            raise RuntimeError(
+                "We have detected a circular dependency involving a resource of type"
+                + f" {res._type} named {res._name}.\n"
+                + "Please review any `depends_on`, `parent` or other dependency relationships between your resources to ensure "
+                + "no cycles have been introduced in your program."
+            )
+
+        from .. import ComponentResource
+
+        # Local component resources act as aggregations of their descendents.
+        # Rather than adding the component resource itself, each child resource
+        # is added as a dependency.
+        if isinstance(res, ComponentResource) and not res._remote:
+            # Copy the set before iterating so that any concurrent child additions during
+            # the dependency computation (which is async, so can be interleaved with other
+            # operations including child resource construction which adds children to this
+            # resource) do not trigger modification during iteration errors.
+            child_resources = res._childResources.copy()
+            for child in child_resources:
+                res_list.append((child, from_resource))
+        else:
+            urn = await res.urn.future()
+            if urn:
+                deps[urn] = res
+
+
+async def _expand_dependencies(
+    deps: Iterable["Resource"], from_resource: Optional["Resource"]
+) -> dict[str, "Resource"]:
+    """
+    _expand_dependencies expands the given iterable of Resources into a map of URN -> Resource
+    """
+
+    expanded_deps: dict[str, "Resource"] = {}
+    for d in deps:
+        await _add_dependency(expanded_deps, d, from_resource)
+
+    return expanded_deps
+
+
 async def serialize_property(
     value: "Input[Any]",
-    deps: List["Resource"],
+    deps: Optional[List["Resource"]],
+    property_key: Optional[str],
+    resource_obj: Optional["Resource"] = None,
     input_transformer: Optional[Callable[[str], str]] = None,
     typ: Optional[type] = None,
-    keep_output_values: Optional[bool] = None,
+    keep_output_values: bool = False,
+    exclude_resource_refs_from_deps: bool = False,
 ) -> Any:
     """
     Serializes a single Input into a form suitable for remoting to the engine, awaiting
@@ -241,7 +376,26 @@ async def serialize_property(
     When `typ` is specified, the metadata from the type is used to translate Python snake_case
     names to Pulumi camelCase names, rather than using the `input_transformer`.
 
-    If `keep_output_values` is true and the monitor supports output values, they will be kept.
+    :param Input[Any] value: The value to serialize.
+
+    :param Optional[List["Resource"]] deps: Dependent resources discovered during serialization are added to this list.
+
+    :param Optional[str] property_key: The name of the property being serialized.
+
+    :param Optional[Resource] resource_obj: Optional resource object to use to provide better error messages.
+
+    :param Optional[Callable[[str], str]]input_transformer: Optional name translator.
+
+    :param Optional[type] typ: Optional input type to use for name translations rather than using the
+    input_transformer.
+
+    :param bool keep_output_values: If true, output values will be kept (only if the monitor
+    supports output values).
+
+    :param bool exclude_resource_refs_from_deps: If true, resource references will not be added to
+    `deps` during serialization (only if the monitor supports resource references). This is
+    useful for remote components (i.e. MLCs) and resource method calls where we want property
+    dependencies to be empty for a property that only contains resource references.
     """
 
     # Set typ to T if it's Optional[T], Input[T], or InputType[T].
@@ -255,14 +409,21 @@ async def serialize_property(
     # Exclude some built-in types that are instances of Sequence that we don't want to treat as sequences here.
     # From: https://github.com/python/cpython/blob/master/Lib/_collections_abc.py
     if isinstance(value, abc.Sequence) and not isinstance(
-        value, (tuple, str, range, memoryview, bytes, bytearray)
+        value, (str, range, memoryview, bytes, bytearray)
     ):
         element_type = _get_list_element_type(typ)
         props = []
         for elem in value:
             props.append(
                 await serialize_property(
-                    elem, deps, input_transformer, element_type, keep_output_values
+                    elem,
+                    deps,
+                    property_key,
+                    resource_obj,
+                    input_transformer,
+                    element_type,
+                    keep_output_values,
+                    exclude_resource_refs_from_deps,
                 )
             )
 
@@ -277,17 +438,36 @@ async def serialize_property(
         is_custom = known_types.is_custom_resource(value)
         resource_id = cast("CustomResource", value).id if is_custom else None
 
+        if (
+            exclude_resource_refs_from_deps
+            and await settings.monitor_supports_resource_references()
+        ):
+            # If excluding resource references from dependencies and the monitor supports resource
+            # references, we don't want to track this dependency, so we set `deps` to `None` so when
+            # serializing the `id` and `urn` the resource won't be included in the caller's `deps`.
+            deps = None
+
         # If we're retaining resources, serialize the resource as a reference.
         if await settings.monitor_supports_resource_references():
             res = {
                 _special_sig_key: _special_resource_sig,
                 "urn": await serialize_property(
-                    resource.urn, deps, input_transformer, keep_output_values=False
+                    resource.urn,
+                    deps,
+                    property_key,
+                    resource_obj,
+                    input_transformer,
+                    keep_output_values=False,
                 ),
             }
             if is_custom:
                 res["id"] = await serialize_property(
-                    resource_id, deps, input_transformer, keep_output_values=False
+                    resource_id,
+                    deps,
+                    property_key,
+                    resource_obj,
+                    input_transformer,
+                    keep_output_values=False,
                 )
             return res
 
@@ -295,6 +475,8 @@ async def serialize_property(
         return await serialize_property(
             resource_id if is_custom else resource.urn,
             deps,
+            property_key,
+            resource_obj,
             input_transformer,
             keep_output_values=False,
         )
@@ -308,17 +490,35 @@ async def serialize_property(
         if hasattr(value, "path"):
             file_asset = cast("FileAsset", value)
             obj["path"] = await serialize_property(
-                file_asset.path, deps, input_transformer, keep_output_values=False
+                file_asset.path,
+                deps,
+                property_key,
+                resource_obj,
+                input_transformer,
+                keep_output_values=False,
+                exclude_resource_refs_from_deps=False,
             )
         elif hasattr(value, "text"):
             str_asset = cast("StringAsset", value)
             obj["text"] = await serialize_property(
-                str_asset.text, deps, input_transformer, keep_output_values=False
+                str_asset.text,
+                deps,
+                property_key,
+                resource_obj,
+                input_transformer,
+                keep_output_values=False,
+                exclude_resource_refs_from_deps=False,
             )
         elif hasattr(value, "uri"):
             remote_asset = cast("RemoteAsset", value)
             obj["uri"] = await serialize_property(
-                remote_asset.uri, deps, input_transformer, keep_output_values=False
+                remote_asset.uri,
+                deps,
+                property_key,
+                resource_obj,
+                input_transformer,
+                keep_output_values=False,
+                exclude_resource_refs_from_deps=False,
             )
         else:
             raise AssertionError(f"unknown asset type: {value!r}")
@@ -334,17 +534,35 @@ async def serialize_property(
         if hasattr(value, "assets"):
             asset_archive = cast("AssetArchive", value)
             obj["assets"] = await serialize_property(
-                asset_archive.assets, deps, input_transformer, keep_output_values=False
+                asset_archive.assets,
+                deps,
+                property_key,
+                resource_obj,
+                input_transformer,
+                keep_output_values=False,
+                exclude_resource_refs_from_deps=False,
             )
         elif hasattr(value, "path"):
             file_archive = cast("FileArchive", value)
             obj["path"] = await serialize_property(
-                file_archive.path, deps, input_transformer, keep_output_values=False
+                file_archive.path,
+                deps,
+                property_key,
+                resource_obj,
+                input_transformer,
+                keep_output_values=False,
+                exclude_resource_refs_from_deps=False,
             )
         elif hasattr(value, "uri"):
             remote_archive = cast("RemoteArchive", value)
             obj["uri"] = await serialize_property(
-                remote_archive.uri, deps, input_transformer, keep_output_values=False
+                remote_archive.uri,
+                deps,
+                property_key,
+                resource_obj,
+                input_transformer,
+                keep_output_values=False,
+                exclude_resource_refs_from_deps=False,
             )
         else:
             raise AssertionError(f"unknown archive type: {value!r}")
@@ -361,13 +579,21 @@ async def serialize_property(
         awaitable = cast("Any", value)
         future_return = await asyncio.ensure_future(awaitable)
         return await serialize_property(
-            future_return, deps, input_transformer, typ, keep_output_values
+            future_return,
+            deps,
+            property_key,
+            resource_obj,
+            input_transformer,
+            typ,
+            keep_output_values,
+            exclude_resource_refs_from_deps,
         )
 
     if known_types.is_output(value):
         output = cast("Output", value)
         value_resources: Set["Resource"] = await output.resources()
-        deps.extend(value_resources)
+        if deps is not None:
+            deps.extend(value_resources)
 
         # When serializing an Output, we will either serialize it as its resolved value or the
         # "unknown value" sentinel. We will do the former for all outputs created directly by user
@@ -379,18 +605,26 @@ async def serialize_property(
         value = await serialize_property(
             output.future(),
             promise_deps,
+            property_key,
+            resource_obj,
             input_transformer,
             typ,
             keep_output_values=False,
         )
-        deps.extend(promise_deps)
+        if deps is not None:
+            deps.extend(promise_deps)
         value_resources.update(promise_deps)
 
         if keep_output_values and await settings.monitor_supports_output_values():
             urn_deps: List["Resource"] = []
             for resource in value_resources:
                 await serialize_property(
-                    resource.urn, urn_deps, input_transformer, keep_output_values=False
+                    resource.urn,
+                    urn_deps,
+                    property_key,
+                    resource_obj,
+                    input_transformer,
+                    keep_output_values=False,
                 )
             promise_deps.extend(set(urn_deps))
             value_resources.update(urn_deps)
@@ -424,7 +658,14 @@ async def serialize_property(
 
         return {
             k: await serialize_property(
-                v, deps, input_transformer, types.get(k), keep_output_values
+                v,
+                deps,
+                property_key,
+                resource_obj,
+                input_transformer,
+                types.get(k),
+                keep_output_values,
+                exclude_resource_refs_from_deps,
             )
             for k, v in value.items()
         }
@@ -441,18 +682,16 @@ async def serialize_property(
             if _types.is_input_type(typ):
                 # If it's intended to be an input type, translate using the type's metadata.
                 py_name_to_pulumi_name = _types.input_type_py_to_pulumi_names(typ)
-                # pylint: disable=C3001
                 types = _types.input_type_types(typ)
-                # pylint: disable=C3001
                 translate = lambda k: py_name_to_pulumi_name.get(k) or k
+
                 get_type = types.get
             else:
                 # Otherwise, don't do any translation of user-defined dict keys.
-                origin = _types.get_origin(typ)
+                origin = get_origin(typ)
                 if typ is dict or origin in [dict, Dict, Mapping, abc.Mapping]:
-                    args = _types.get_args(typ)
+                    args = get_args(typ)
                     if len(args) == 2 and args[0] is str:
-                        # pylint: disable=C3001
                         get_type = lambda k: args[1]
                         translate = None
                 else:
@@ -477,21 +716,35 @@ async def serialize_property(
             obj[transformed_key] = await serialize_property(
                 value[k],
                 deps,
+                k,
+                resource_obj,
                 input_transformer,
                 get_type(transformed_key),
                 keep_output_values,
+                exclude_resource_refs_from_deps,
             )
 
         return obj
 
     # Ensure that we have a value that Protobuf understands.
     if not isLegalProtobufValue(value):
+        if property_key is not None and resource_obj is not None:
+            raise ValueError(
+                f"unexpected input of type {type(value).__name__} for {property_key} in {type(resource_obj).__name__}"
+            )
+        if property_key is not None:
+            raise ValueError(
+                f"unexpected input of type {type(value).__name__} for {property_key}"
+            )
+        if resource_obj is not None:
+            raise ValueError(
+                f"unexpected input of type {type(value).__name__} in {type(resource_obj).__name__}"
+            )
         raise ValueError(f"unexpected input of type {type(value).__name__}")
 
     return value
 
 
-# pylint: disable=too-many-return-statements
 def deserialize_properties(
     props_struct: struct_pb2.Struct,
     keep_unknowns: Optional[bool] = None,
@@ -507,13 +760,13 @@ def deserialize_properties(
     # We assume that we are deserializing properties that we got from a Resource RPC endpoint,
     # which has type `Struct` in our gRPC proto definition.
     if _special_sig_key in props_struct:
-        from .. import (  # pylint: disable=import-outside-toplevel
-            FileAsset,
-            StringAsset,
-            RemoteAsset,
+        from .. import (
             AssetArchive,
             FileArchive,
+            FileAsset,
             RemoteArchive,
+            RemoteAsset,
+            StringAsset,
         )
 
         if props_struct[_special_sig_key] == _special_asset_sig:
@@ -567,6 +820,106 @@ def deserialize_properties(
             output[k] = value
 
     return output
+
+
+def struct_contains_unknowns(props_struct: struct_pb2.Struct) -> bool:
+    """
+    Returns True if the given protobuf struct contains any unknown values.
+    """
+    for _, v in list(props_struct.items()):
+        if v == UNKNOWN:
+            return True
+        if isinstance(v, struct_pb2.Struct):
+            if struct_contains_unknowns(v):
+                return True
+        if isinstance(v, struct_pb2.ListValue):
+            for item in v:
+                if isinstance(item, struct_pb2.Struct):
+                    if struct_contains_unknowns(item):
+                        return True
+    return False
+
+
+def _unwrap_rpc_secret_struct_properties(value: Any) -> Tuple[Any, bool]:
+    if _is_rpc_struct_secret(value):
+        unwrapped = _unwrap_rpc_struct_secret(value)
+        return (unwrapped, True)
+    if isinstance(value, struct_pb2.Struct):
+        contains_secrets = False
+        value_struct = struct_pb2.Struct()
+        for k, v in list(value.items()):
+            unwrapped, secret_element = _unwrap_rpc_secret_struct_properties(v)
+            contains_secrets = contains_secrets or secret_element
+            value_struct[k] = unwrapped
+        return (value_struct, contains_secrets)
+    if isinstance(value, dict):
+        contains_secrets = False
+        output = {}
+        for k, v in value.items():
+            unwrapped, secret_element = _unwrap_rpc_secret_struct_properties(v)
+            contains_secrets = contains_secrets or secret_element
+            output[k] = unwrapped
+        return (output, contains_secrets)
+    if isinstance(value, list):
+        contains_secrets = False
+        elements = []
+        for list_element in value:
+            unwrapped, secret_element = _unwrap_rpc_secret_struct_properties(
+                list_element
+            )
+            contains_secrets = contains_secrets or secret_element
+            elements.append(unwrapped)
+        return (elements, contains_secrets)
+    if isinstance(value, struct_pb2.ListValue):
+        contains_secrets = False
+        list_values = []
+        for list_value in value.values:
+            unwrapped, secret_element = _unwrap_rpc_secret_struct_properties(list_value)
+            contains_secrets = contains_secrets or secret_element
+            list_values.append(unwrapped)
+        return list_values, contains_secrets
+    if isinstance(value, struct_pb2.Value):
+        if value.WhichOneof("kind") == "struct_value":
+            unwrapped, secret_element = _unwrap_rpc_secret_struct_properties(
+                value.struct_value
+            )
+            return unwrapped, secret_element
+        if value.WhichOneof("kind") == "list_value":
+            unwrapped, secret_element = _unwrap_rpc_secret_struct_properties(
+                value.list_value
+            )
+            return unwrapped, secret_element
+        if value.WhichOneof("kind") == "string_value":
+            return value.string_value, False
+        if value.WhichOneof("kind") == "number_value":
+            return value.number_value, False
+        if value.WhichOneof("kind") == "bool_value":
+            return value.bool_value, False
+        if value.WhichOneof("kind") == "null_value":
+            return None, False
+    return (value, False)
+
+
+def deserialize_properties_unwrap_secrets(
+    props_struct: struct_pb2.Struct,
+    keep_unknowns: Optional[bool] = None,
+    keep_internal: Optional[bool] = None,
+) -> Tuple[Any, bool]:
+    """
+    Similar to deserialize_properties except that it unwraps secrets and returns a boolean
+    indicating whether the resulting object contained a secret.
+    """
+    output = deserialize_properties(props_struct, keep_unknowns, keep_internal)
+    if isinstance(output, dict):
+        is_secret = False
+        for k, v in output.items():
+            if is_rpc_secret(v):
+                is_secret = True
+                output[k] = unwrap_rpc_secret(v)
+        return (output, is_secret)
+    if is_rpc_secret(output):
+        return (unwrap_rpc_secret(output), True)
+    return (output, False)
 
 
 def deserialize_resource(
@@ -623,7 +976,7 @@ def deserialize_output_value(ref_struct: struct_pb2.Struct) -> "Output[Any]":
 
     resources: Set["Resource"] = set()
     if "dependencies" in ref_struct:
-        from ..resource import (  # pylint: disable=import-outside-toplevel
+        from ..resource import (
             DependencyResource,
         )
 
@@ -631,7 +984,7 @@ def deserialize_output_value(ref_struct: struct_pb2.Struct) -> "Output[Any]":
         for urn in dependencies:
             resources.add(DependencyResource(urn))
 
-    from .. import Output  # pylint: disable=import-outside-toplevel
+    from .. import Output
 
     return Output(resources, value_future, is_known_future, is_secret_future)
 
@@ -645,6 +998,27 @@ def is_rpc_secret(value: Any) -> bool:
         and _special_sig_key in value
         and value[_special_sig_key] == _special_secret_sig
     )
+
+
+def _is_rpc_struct_secret(value: Any) -> bool:
+    """
+    Returns if a given python value is actually a wrapped secret.
+    """
+    return (
+        isinstance(value, struct_pb2.Struct)
+        and _special_sig_key in value.fields
+        and value[_special_sig_key] == _special_secret_sig
+    )
+
+
+def _unwrap_rpc_struct_secret(value: struct_pb2.Struct) -> Any:
+    """
+    Given a value, if it is a wrapped secret value, return the underlying value, otherwise return the value unmodified.
+    """
+    if _is_rpc_struct_secret(value):
+        return value["value"]
+
+    return value
 
 
 def wrap_rpc_secret(value: Any) -> Any:
@@ -675,7 +1049,7 @@ def deserialize_property(value: Any, keep_unknowns: Optional[bool] = None) -> An
     Deserializes a single protobuf value (either `Struct` or `ListValue`) into idiomatic
     Python values.
     """
-    from ..output import Unknown  # pylint: disable=import-outside-toplevel
+    from ..output import Unknown
 
     if value == UNKNOWN:
         return Unknown() if settings.is_dry_run() or keep_unknowns else None
@@ -724,13 +1098,15 @@ result in the exception being re-thrown.
 """
 
 
-def transfer_properties(res: "Resource", props: "Inputs") -> Dict[str, Resolver]:
-    from .. import Output  # pylint: disable=import-outside-toplevel
+def transfer_properties(
+    res: "Resource", props: "Inputs", custom: bool
+) -> Dict[str, Resolver]:
+    from .. import Output
 
     resolvers: Dict[str, Resolver] = {}
 
     for name in props:
-        if name in ["id", "urn"]:
+        if name == "urn" or (name == "id" and custom):
             # these properties are handled specially elsewhere.
             continue
 
@@ -876,17 +1252,17 @@ def translate_output_properties(
                 return _types.output_type_from_dict(typ, translated_values)
 
             # If typ is a dict, get the type for its values, to pass along for each key.
-            origin = _types.get_origin(typ)
+            origin = get_origin(typ)
             if typ is dict or origin in [dict, Dict, Mapping, abc.Mapping]:
-                args = _types.get_args(typ)
+                args = get_args(typ)
                 if len(args) == 2 and args[0] is str:
-                    # pylint: disable=C3001
                     get_type = lambda k: args[1]
                     # If transform_using_type_metadata is True, don't translate its keys because
                     # it is intended to be a user-defined dict.
                     if transform_using_type_metadata:
                         # pylint: disable=C3001
                         translate = lambda k: k
+
             elif return_none_on_dict_type_mismatch:
                 return None
             else:
@@ -1008,7 +1384,9 @@ def resolve_outputs(
     outputs: struct_pb2.Struct,
     deps: Mapping[str, Set["Resource"]],
     resolvers: Dict[str, Resolver],
+    custom: bool,
     transform_using_type_metadata: bool = False,
+    keep_unknowns: bool = False,
 ):
     # Produce a combined set of property states, starting with inputs and then applying
     # outputs.  If the same property exists in the inputs and outputs states, the output wins.
@@ -1023,12 +1401,13 @@ def resolve_outputs(
     )
     if transform_using_type_metadata:
         pulumi_to_py_names = _types.resource_pulumi_to_py_names(resource_cls)
-        # pylint: disable=C3001
-        translate = lambda k: pulumi_to_py_names.get(k) or k
-        # pylint: disable=C3001
-        translate_to_pass = lambda k: k
 
-    for key, value in deserialize_properties(outputs).items():
+        # pylint: disable=C3001
+        translate = lambda prop: pulumi_to_py_names.get(prop) or prop
+        # pylint: disable=C3001
+        translate_to_pass = lambda prop: prop
+
+    for key, value in deserialize_properties(outputs, keep_unknowns).items():
         # Outputs coming from the provider are NOT translated. Do so here.
         translated_key = translate(key)
 
@@ -1071,17 +1450,20 @@ def resolve_outputs(
                     return_none_on_dict_type_mismatch=True,
                 )
 
-    resolve_properties(resolvers, all_properties, translated_deps)
+    resolve_properties(resolvers, all_properties, translated_deps, custom)
 
 
 def resolve_properties(
     resolvers: Dict[str, Resolver],
     all_properties: Dict[str, Any],
     deps: Mapping[str, Set["Resource"]],
+    custom: bool,
 ):
     for key, value in all_properties.items():
         # Skip "id" and "urn", since we handle those specially.
-        if key in ["id", "urn"]:
+        # Only skip ID if this is a custom resource, meaning non-component resource.
+        # For component resources, using ID as output property is allowed.
+        if key == "urn" or (key == "id" and custom):
             continue
 
         # Otherwise, unmarshal the value, and store it on the resource object.
@@ -1107,7 +1489,7 @@ def resolve_properties(
 
         # If this value is a secret, unwrap its inner value.
         is_secret = is_rpc_secret(value)
-        value = unwrap_rpc_secret(value)
+        unwrapped_value = unwrap_rpc_secret(value)
 
         # If either we are performing a real deployment, or this is a stable property value, we
         # can propagate its final value.  Otherwise, it must be undefined, since we don't know
@@ -1115,11 +1497,17 @@ def resolve_properties(
         if not settings.is_dry_run():
             # normal 'pulumi up'.  resolve the output with the value we got back
             # from the engine.  That output can always run its .apply calls.
-            resolve(value, True, is_secret, deps.get(key), None)
+            resolve(unwrapped_value, True, is_secret, deps.get(key), None)
         else:
             # We're previewing. If the engine was able to give us a reasonable value back,
             # then use it. Otherwise, inform the Output that the value isn't known.
-            resolve(value, value is not None, is_secret, deps.get(key), None)
+            resolve(
+                unwrapped_value,
+                unwrapped_value is not None,
+                is_secret,
+                deps.get(key),
+                None,
+            )
 
     # `allProps` may not have contained a value for every resolver: for example, optional outputs may not be present.
     # We will resolve all of these values as `None`, and will mark the value as known if we are not running a

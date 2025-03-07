@@ -28,8 +28,10 @@ import * as vm from "vm";
 import * as v8Hooks from "./v8Hooks";
 
 /**
- * Given a function, returns the file, line and column number in the file where this function was
- * defined. Returns { "", 0, 0 } if the location cannot be found or if the given function has no Script.
+ * Given a function, returns the file, line and column number in the file where
+ * this function was defined. Returns `{ "", 0, 0 }` if the location cannot be
+ * found or if the given function has no script.
+ *
  * @internal
  */
 export async function getFunctionLocationAsync(func: Function) {
@@ -41,7 +43,7 @@ export async function getFunctionLocationAsync(func: Function) {
 
     // There should normally be an internal property called [[FunctionLocation]]:
     // https://chromium.googlesource.com/v8/v8.git/+/3f99afc93c9ba1ba5df19f123b93cc3079893c9b/src/inspector/v8-debugger.cc#793
-    const functionLocation = internalProperties.find(p => p.name === "[[FunctionLocation]]");
+    const functionLocation = internalProperties.find((p) => p.name === "[[FunctionLocation]]");
     if (!functionLocation || !functionLocation.value || !functionLocation.value.value) {
         return { file: "", line: 0, column: 0 };
     }
@@ -57,19 +59,28 @@ export async function getFunctionLocationAsync(func: Function) {
 }
 
 /**
- * Given a function and a free variable name, lookupCapturedVariableValue looks up the value of that free variable
- * in the scope chain of the provided function. If the free variable is not found, `throwOnFailure` indicates
- * whether or not this function should throw or return `undefined.
+ * Given a function and a free variable name, looks up the value of that free
+ * variable in the scope chain of the provided function. If the free variable is
+ * not found, `throwOnFailure` indicates whether or not this function should
+ * throw or return `undefined`.
  *
- * @param func The function whose scope chain is to be analyzed
- * @param freeVariable The name of the free variable to inspect
- * @param throwOnFailure If true, throws if the free variable can't be found.
- * @returns The value of the free variable. If `throwOnFailure` is false, returns `undefined` if not found.
+ * @param func
+ *  The function whose scope chain is to be analyzed
+ * @param freeVariable
+ *  The name of the free variable to inspect
+ * @param throwOnFailure
+ *  If true, throws if the free variable can't be found.
+ * @returns
+ *  The value of the free variable. If `throwOnFailure` is false, returns
+ *  `undefined` if not found.
+ *
  * @internal
  */
 export async function lookupCapturedVariableValueAsync(
-    func: Function, freeVariable: string, throwOnFailure: boolean): Promise<any> {
-
+    func: Function,
+    freeVariable: string,
+    throwOnFailure: boolean,
+): Promise<any> {
     // First, find the runtime's internal id for this function.
     const functionId = await getRuntimeIdForFunctionAsync(func);
 
@@ -78,7 +89,7 @@ export async function lookupCapturedVariableValueAsync(
 
     // There should normally be an internal property called [[Scopes]]:
     // https://chromium.googlesource.com/v8/v8.git/+/3f99afc93c9ba1ba5df19f123b93cc3079893c9b/src/inspector/v8-debugger.cc#820
-    const scopes = internalProperties.find(p => p.name === "[[Scopes]]");
+    const scopes = internalProperties.find((p) => p.name === "[[Scopes]]");
     if (!scopes) {
         throw new Error("Could not find [[Scopes]] property");
     }
@@ -119,18 +130,35 @@ export async function lookupCapturedVariableValueAsync(
 }
 
 // We want to call util.promisify on inspector.Session.post. However, due to all the overloads of
-// that method, promisify gets confused.  To prevent this, we cast our session object down to an
+// that method, promisify gets confused. To prevent this, we cast our session object down to an
 // interface containing only the single overload we care about.
 type PostSession<TMethod, TParams, TReturn> = {
     post(method: TMethod, params?: TParams, callback?: (err: Error | null, params: TReturn) => void): void;
 };
 
-type EvaluationSession = PostSession<"Runtime.evaluate", inspector.Runtime.EvaluateParameterType, inspector.Runtime.EvaluateReturnType>;
-type GetPropertiesSession = PostSession<"Runtime.getProperties", inspector.Runtime.GetPropertiesParameterType, inspector.Runtime.GetPropertiesReturnType>;
-type CallFunctionSession = PostSession<"Runtime.callFunctionOn", inspector.Runtime.CallFunctionOnParameterType, inspector.Runtime.CallFunctionOnReturnType>;
+type EvaluationSession = PostSession<
+    "Runtime.evaluate",
+    inspector.Runtime.EvaluateParameterType,
+    inspector.Runtime.EvaluateReturnType
+>;
+type GetPropertiesSession = PostSession<
+    "Runtime.getProperties",
+    inspector.Runtime.GetPropertiesParameterType,
+    inspector.Runtime.GetPropertiesReturnType
+>;
+type CallFunctionSession = PostSession<
+    "Runtime.callFunctionOn",
+    inspector.Runtime.CallFunctionOnParameterType,
+    inspector.Runtime.CallFunctionOnReturnType
+>;
 type ContextSession = {
     post(method: "Runtime.disable" | "Runtime.enable", callback?: (err: Error | null) => void): void;
-    once(event: "Runtime.executionContextCreated", listener: (message: inspector.InspectorNotification<inspector.Runtime.ExecutionContextCreatedEventDataType>) => void): void;
+    once(
+        event: "Runtime.executionContextCreated",
+        listener: (
+            message: inspector.InspectorNotification<inspector.Runtime.ExecutionContextCreatedEventDataType>,
+        ) => void,
+    ): void;
 };
 
 type InflightContext = {
@@ -140,6 +168,7 @@ type InflightContext = {
     calls: Record<string, any>;
     currentCallId: number;
 };
+
 // Isolated singleton context accessible from the inspector.
 // Used instead of `global` object to support executions with multiple V8 vm contexts as, e.g., done by Jest.
 let inflightContextCache: Promise<InflightContext> | undefined;
@@ -150,6 +179,7 @@ function inflightContext() {
     inflightContextCache = createContext();
     return inflightContextCache;
 }
+
 async function createContext(): Promise<InflightContext> {
     const context: InflightContext = {
         contextId: 0,
@@ -163,8 +193,8 @@ async function createContext(): Promise<InflightContext> {
 
     // Create own context with known context id and functionsContext as `global`
     await post.call(session, "Runtime.enable");
-    const contextIdAsync = new Promise<number>(resolve => {
-        session.once("Runtime.executionContextCreated", event => {
+    const contextIdAsync = new Promise<number>((resolve) => {
+        session.once("Runtime.executionContextCreated", (event) => {
             resolve(event.params.context.id);
         });
     });
@@ -202,7 +232,10 @@ async function getRuntimeIdForFunctionAsync(func: Function): Promise<inspector.R
         const retType = await post.call(session, "Runtime.evaluate", { contextId, expression });
 
         if (retType.exceptionDetails) {
-            throw new Error(`Error calling "Runtime.evaluate(${expression})" on context ${contextId}: ` + retType.exceptionDetails.text);
+            throw new Error(
+                `Error calling "Runtime.evaluate(${expression})" on context ${contextId}: ` +
+                    retType.exceptionDetails.text,
+            );
         }
 
         const remoteObject = retType.result;
@@ -215,26 +248,28 @@ async function getRuntimeIdForFunctionAsync(func: Function): Promise<inspector.R
         }
 
         return remoteObject.objectId;
-    }
-    finally {
+    } finally {
         delete context.functions[currentFunctionName];
     }
 }
 
 async function runtimeGetPropertiesAsync(
     objectId: inspector.Runtime.RemoteObjectId,
-    ownProperties: boolean | undefined) {
+    ownProperties: boolean | undefined,
+) {
     const session = <GetPropertiesSession>await v8Hooks.getSessionAsync();
     const post = util.promisify(session.post);
 
     // This cast will become unnecessary when we move to TS 3.1.6 or above.  In that version they
     // support typesafe '.call' calls.
-    const retType = <inspector.Runtime.GetPropertiesReturnType>await post.call(
-        session, "Runtime.getProperties", { objectId, ownProperties });
+    const retType = <inspector.Runtime.GetPropertiesReturnType>(
+        await post.call(session, "Runtime.getProperties", { objectId, ownProperties })
+    );
 
     if (retType.exceptionDetails) {
-        throw new Error(`Error calling "Runtime.getProperties(${objectId}, ${ownProperties})": `
-            + retType.exceptionDetails.text);
+        throw new Error(
+            `Error calling "Runtime.getProperties(${objectId}, ${ownProperties})": ` + retType.exceptionDetails.text,
+        );
     }
 
     return { internalProperties: retType.internalProperties || [], properties: retType.result };
@@ -262,17 +297,15 @@ async function getValueForObjectId(objectId: inspector.Runtime.RemoteObjectId): 
 
     // This cast will become unnecessary when we move to TS 3.1.6 or above.  In that version they
     // support typesafe '.call' calls.
-    const retType = <inspector.Runtime.CallFunctionOnReturnType>await post.call(
-        session, "Runtime.callFunctionOn", {
-            objectId,
-            functionDeclaration: `function () {
+    const retType = <inspector.Runtime.CallFunctionOnReturnType>await post.call(session, "Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: `function () {
                 calls["${tableId}"] = this;
             }`,
-        });
+    });
 
     if (retType.exceptionDetails) {
-        throw new Error(`Error calling "Runtime.callFunction(${objectId})": `
-            + retType.exceptionDetails.text);
+        throw new Error(`Error calling "Runtime.callFunction(${objectId})": ` + retType.exceptionDetails.text);
     }
 
     if (!context.calls.hasOwnProperty(tableId)) {
@@ -284,4 +317,28 @@ async function getValueForObjectId(objectId: inspector.Runtime.RemoteObjectId): 
     delete context.calls[tableId];
 
     return val;
+}
+
+export async function getBoundFunction(
+    func: Function,
+): Promise<{ targetFunctionText: string; boundThisValue: any; boundArgsValues: any[] }> {
+    const functionId = await getRuntimeIdForFunctionAsync(func);
+    const { internalProperties } = await runtimeGetPropertiesAsync(functionId, /*ownProperties:*/ false);
+
+    const desc = internalProperties.find((p) => p.name === "[[TargetFunction]]");
+    const targetFunctionText = desc?.value?.description;
+    if (!targetFunctionText) {
+        throw new Error("function is not a bound function");
+    }
+
+    const boundThisValue = internalProperties.find((p) => p.name === "[[BoundThis]]")?.value?.value;
+
+    const boundArgsObjectId = internalProperties.find((p) => p.name === "[[BoundArgs]]")?.value?.objectId;
+    let boundArgsValues: any[] = [];
+    if (boundArgsObjectId) {
+        const { properties } = await runtimeGetPropertiesAsync(boundArgsObjectId, /*ownProperties:*/ false);
+        boundArgsValues = properties.filter((p) => p.enumerable).map((p) => p.value?.value);
+    }
+
+    return { targetFunctionText, boundThisValue, boundArgsValues };
 }

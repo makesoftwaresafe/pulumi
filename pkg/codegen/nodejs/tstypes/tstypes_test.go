@@ -15,6 +15,7 @@
 package tstypes
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -29,7 +30,7 @@ func TestParenInsert(t *testing.T) {
 
 	ast := astGenerator()
 	rapid.Check(t, func(t *rapid.T) {
-		example := ast.Draw(t, "ast").(TypeAst)
+		example := ast.Draw(t, "ast")
 
 		t.Logf("example: %s", spew.Sdump(example))
 		t.Logf("example type: %s", TypeLiteral(example))
@@ -37,7 +38,6 @@ func TestParenInsert(t *testing.T) {
 		tokens := (&typeScriptTypeUnparser{}).unparse(example)
 
 		parsed, err := (&typeScriptTypeParser{}).parse(tokens)
-
 		if err != nil {
 			t.Error(err)
 			return
@@ -47,14 +47,14 @@ func TestParenInsert(t *testing.T) {
 	})
 }
 
-func astGenerator() *rapid.Generator {
+func astGenerator() *rapid.Generator[TypeAst] {
 	names := rapid.OneOf(rapid.Just("x"), rapid.Just("y"))
 
-	var ast func(depth int) *rapid.Generator
-	ast = func(depth int) *rapid.Generator {
+	var ast func(depth int) *rapid.Generator[TypeAst]
+	ast = func(depth int) *rapid.Generator[TypeAst] {
 		if depth <= 1 {
 			return rapid.Custom(func(t *rapid.T) TypeAst {
-				n := names.Draw(t, "name").(string)
+				n := names.Draw(t, "name")
 				return &idType{n}
 			})
 		}
@@ -63,17 +63,17 @@ func astGenerator() *rapid.Generator {
 		subs := rapid.SliceOfN(sub, 2, 4)
 
 		mapGen := rapid.Custom(func(t *rapid.T) TypeAst {
-			element := sub.Draw(t, "ast").(TypeAst)
+			element := sub.Draw(t, "ast")
 			return &mapType{element}
 		})
 
 		arrGen := rapid.Custom(func(t *rapid.T) TypeAst {
-			element := sub.Draw(t, "ast").(TypeAst)
+			element := sub.Draw(t, "ast")
 			return &arrayType{element}
 		})
 
 		unionGen := rapid.Custom(func(t *rapid.T) TypeAst {
-			ts := subs.Draw(t, "asts").([]TypeAst)
+			ts := subs.Draw(t, "asts")
 			return &unionType{ts[0], ts[1], ts[2:]}
 		})
 
@@ -82,8 +82,8 @@ func astGenerator() *rapid.Generator {
 
 	n := rapid.IntRange(1, 3)
 	return rapid.Custom(func(t *rapid.T) TypeAst {
-		sz := n.Draw(t, "n").(int)
-		return ast(sz).Draw(t, "ast").(TypeAst)
+		sz := n.Draw(t, "n")
+		return ast(sz).Draw(t, "ast")
 	})
 }
 
@@ -95,7 +95,7 @@ func (p *typeScriptTypeParser) parse(tokens []typeToken) (TypeAst, error) {
 		return nil, err
 	}
 	if len(rest) > 0 {
-		return nil, fmt.Errorf("Unexpected trailing tokens")
+		return nil, errors.New("Unexpected trailing tokens")
 	}
 	return e, nil
 }
@@ -106,9 +106,10 @@ func (p *typeScriptTypeParser) parseType(tokens []typeToken) (TypeAst, []typeTok
 
 func (p *typeScriptTypeParser) parseType1(tokens []typeToken) (TypeAst, []typeToken, error) {
 	if len(tokens) == 0 {
-		return nil, nil, fmt.Errorf("Expect more tokens")
+		return nil, nil, errors.New("Expect more tokens")
 	}
 
+	//nolint:exhaustive // Only a subset of token kinds are needed for testing.
 	switch tokens[0].kind {
 	case openParen:
 		t, rest, err := p.parseType(tokens[1:])
@@ -116,7 +117,7 @@ func (p *typeScriptTypeParser) parseType1(tokens []typeToken) (TypeAst, []typeTo
 			return nil, nil, err
 		}
 		if len(rest) == 0 || rest[0].kind != closeParen {
-			return nil, nil, fmt.Errorf("Expect `)`")
+			return nil, nil, errors.New("Expect `)`")
 		}
 		return t, rest[1:], nil
 	case openMap:
@@ -125,7 +126,7 @@ func (p *typeScriptTypeParser) parseType1(tokens []typeToken) (TypeAst, []typeTo
 			return nil, nil, err
 		}
 		if len(rest) == 0 {
-			return nil, nil, fmt.Errorf("Expect `}`, but got nothing")
+			return nil, nil, errors.New("Expect `}`, but got nothing")
 		}
 		if rest[0].kind != closeMap {
 			return nil, nil, fmt.Errorf("Expect `}`, but got %s", toLiteral(rest))

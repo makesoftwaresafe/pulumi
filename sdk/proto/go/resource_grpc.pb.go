@@ -26,10 +26,17 @@ type ResourceMonitorClient interface {
 	SupportsFeature(ctx context.Context, in *SupportsFeatureRequest, opts ...grpc.CallOption) (*SupportsFeatureResponse, error)
 	Invoke(ctx context.Context, in *ResourceInvokeRequest, opts ...grpc.CallOption) (*InvokeResponse, error)
 	StreamInvoke(ctx context.Context, in *ResourceInvokeRequest, opts ...grpc.CallOption) (ResourceMonitor_StreamInvokeClient, error)
-	Call(ctx context.Context, in *CallRequest, opts ...grpc.CallOption) (*CallResponse, error)
+	Call(ctx context.Context, in *ResourceCallRequest, opts ...grpc.CallOption) (*CallResponse, error)
 	ReadResource(ctx context.Context, in *ReadResourceRequest, opts ...grpc.CallOption) (*ReadResourceResponse, error)
 	RegisterResource(ctx context.Context, in *RegisterResourceRequest, opts ...grpc.CallOption) (*RegisterResourceResponse, error)
 	RegisterResourceOutputs(ctx context.Context, in *RegisterResourceOutputsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Register a resource transform for the stack
+	RegisterStackTransform(ctx context.Context, in *Callback, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Register an invoke transform for the stack
+	RegisterStackInvokeTransform(ctx context.Context, in *Callback, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Registers a package and allocates a packageRef. The same package can be registered multiple times in Pulumi.
+	// Multiple requests are idempotent and guaranteed to return the same result.
+	RegisterPackage(ctx context.Context, in *RegisterPackageRequest, opts ...grpc.CallOption) (*RegisterPackageResponse, error)
 }
 
 type resourceMonitorClient struct {
@@ -90,7 +97,7 @@ func (x *resourceMonitorStreamInvokeClient) Recv() (*InvokeResponse, error) {
 	return m, nil
 }
 
-func (c *resourceMonitorClient) Call(ctx context.Context, in *CallRequest, opts ...grpc.CallOption) (*CallResponse, error) {
+func (c *resourceMonitorClient) Call(ctx context.Context, in *ResourceCallRequest, opts ...grpc.CallOption) (*CallResponse, error) {
 	out := new(CallResponse)
 	err := c.cc.Invoke(ctx, "/pulumirpc.ResourceMonitor/Call", in, out, opts...)
 	if err != nil {
@@ -126,6 +133,33 @@ func (c *resourceMonitorClient) RegisterResourceOutputs(ctx context.Context, in 
 	return out, nil
 }
 
+func (c *resourceMonitorClient) RegisterStackTransform(ctx context.Context, in *Callback, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/pulumirpc.ResourceMonitor/RegisterStackTransform", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *resourceMonitorClient) RegisterStackInvokeTransform(ctx context.Context, in *Callback, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/pulumirpc.ResourceMonitor/RegisterStackInvokeTransform", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *resourceMonitorClient) RegisterPackage(ctx context.Context, in *RegisterPackageRequest, opts ...grpc.CallOption) (*RegisterPackageResponse, error) {
+	out := new(RegisterPackageResponse)
+	err := c.cc.Invoke(ctx, "/pulumirpc.ResourceMonitor/RegisterPackage", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ResourceMonitorServer is the server API for ResourceMonitor service.
 // All implementations must embed UnimplementedResourceMonitorServer
 // for forward compatibility
@@ -133,10 +167,17 @@ type ResourceMonitorServer interface {
 	SupportsFeature(context.Context, *SupportsFeatureRequest) (*SupportsFeatureResponse, error)
 	Invoke(context.Context, *ResourceInvokeRequest) (*InvokeResponse, error)
 	StreamInvoke(*ResourceInvokeRequest, ResourceMonitor_StreamInvokeServer) error
-	Call(context.Context, *CallRequest) (*CallResponse, error)
+	Call(context.Context, *ResourceCallRequest) (*CallResponse, error)
 	ReadResource(context.Context, *ReadResourceRequest) (*ReadResourceResponse, error)
 	RegisterResource(context.Context, *RegisterResourceRequest) (*RegisterResourceResponse, error)
 	RegisterResourceOutputs(context.Context, *RegisterResourceOutputsRequest) (*emptypb.Empty, error)
+	// Register a resource transform for the stack
+	RegisterStackTransform(context.Context, *Callback) (*emptypb.Empty, error)
+	// Register an invoke transform for the stack
+	RegisterStackInvokeTransform(context.Context, *Callback) (*emptypb.Empty, error)
+	// Registers a package and allocates a packageRef. The same package can be registered multiple times in Pulumi.
+	// Multiple requests are idempotent and guaranteed to return the same result.
+	RegisterPackage(context.Context, *RegisterPackageRequest) (*RegisterPackageResponse, error)
 	mustEmbedUnimplementedResourceMonitorServer()
 }
 
@@ -153,7 +194,7 @@ func (UnimplementedResourceMonitorServer) Invoke(context.Context, *ResourceInvok
 func (UnimplementedResourceMonitorServer) StreamInvoke(*ResourceInvokeRequest, ResourceMonitor_StreamInvokeServer) error {
 	return status.Errorf(codes.Unimplemented, "method StreamInvoke not implemented")
 }
-func (UnimplementedResourceMonitorServer) Call(context.Context, *CallRequest) (*CallResponse, error) {
+func (UnimplementedResourceMonitorServer) Call(context.Context, *ResourceCallRequest) (*CallResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Call not implemented")
 }
 func (UnimplementedResourceMonitorServer) ReadResource(context.Context, *ReadResourceRequest) (*ReadResourceResponse, error) {
@@ -164,6 +205,15 @@ func (UnimplementedResourceMonitorServer) RegisterResource(context.Context, *Reg
 }
 func (UnimplementedResourceMonitorServer) RegisterResourceOutputs(context.Context, *RegisterResourceOutputsRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RegisterResourceOutputs not implemented")
+}
+func (UnimplementedResourceMonitorServer) RegisterStackTransform(context.Context, *Callback) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RegisterStackTransform not implemented")
+}
+func (UnimplementedResourceMonitorServer) RegisterStackInvokeTransform(context.Context, *Callback) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RegisterStackInvokeTransform not implemented")
+}
+func (UnimplementedResourceMonitorServer) RegisterPackage(context.Context, *RegisterPackageRequest) (*RegisterPackageResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RegisterPackage not implemented")
 }
 func (UnimplementedResourceMonitorServer) mustEmbedUnimplementedResourceMonitorServer() {}
 
@@ -236,7 +286,7 @@ func (x *resourceMonitorStreamInvokeServer) Send(m *InvokeResponse) error {
 }
 
 func _ResourceMonitor_Call_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CallRequest)
+	in := new(ResourceCallRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -248,7 +298,7 @@ func _ResourceMonitor_Call_Handler(srv interface{}, ctx context.Context, dec fun
 		FullMethod: "/pulumirpc.ResourceMonitor/Call",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ResourceMonitorServer).Call(ctx, req.(*CallRequest))
+		return srv.(ResourceMonitorServer).Call(ctx, req.(*ResourceCallRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -307,6 +357,60 @@ func _ResourceMonitor_RegisterResourceOutputs_Handler(srv interface{}, ctx conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ResourceMonitor_RegisterStackTransform_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Callback)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ResourceMonitorServer).RegisterStackTransform(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pulumirpc.ResourceMonitor/RegisterStackTransform",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ResourceMonitorServer).RegisterStackTransform(ctx, req.(*Callback))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ResourceMonitor_RegisterStackInvokeTransform_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Callback)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ResourceMonitorServer).RegisterStackInvokeTransform(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pulumirpc.ResourceMonitor/RegisterStackInvokeTransform",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ResourceMonitorServer).RegisterStackInvokeTransform(ctx, req.(*Callback))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ResourceMonitor_RegisterPackage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterPackageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ResourceMonitorServer).RegisterPackage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pulumirpc.ResourceMonitor/RegisterPackage",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ResourceMonitorServer).RegisterPackage(ctx, req.(*RegisterPackageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ResourceMonitor_ServiceDesc is the grpc.ServiceDesc for ResourceMonitor service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -337,6 +441,18 @@ var ResourceMonitor_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RegisterResourceOutputs",
 			Handler:    _ResourceMonitor_RegisterResourceOutputs_Handler,
+		},
+		{
+			MethodName: "RegisterStackTransform",
+			Handler:    _ResourceMonitor_RegisterStackTransform_Handler,
+		},
+		{
+			MethodName: "RegisterStackInvokeTransform",
+			Handler:    _ResourceMonitor_RegisterStackInvokeTransform_Handler,
+		},
+		{
+			MethodName: "RegisterPackage",
+			Handler:    _ResourceMonitor_RegisterPackage_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

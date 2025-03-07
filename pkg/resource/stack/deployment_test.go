@@ -21,14 +21,17 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 
+	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/secrets/b64"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	rasset "github.com/pulumi/pulumi/sdk/v3/go/common/resource/asset"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	resource_testing "github.com/pulumi/pulumi/sdk/v3/go/common/resource/testing"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
@@ -46,7 +49,7 @@ func TestDeploymentSerialization(t *testing.T) {
 			tokens.PackageName("resource/test"),
 			tokens.Type(""),
 			tokens.Type("Test"),
-			tokens.QName("resource-x"),
+			"resource-x",
 		),
 		true,
 		false,
@@ -100,9 +103,13 @@ func TestDeploymentSerialization(t *testing.T) {
 		"",
 		false,
 		"",
+		nil,
+		nil,
+		"",
+		nil,
 	)
 
-	dep, err := SerializeResource(res, config.NopEncrypter, false /* showSecrets */)
+	dep, err := SerializeResource(context.Background(), res, config.NopEncrypter, false /* showSecrets */)
 	assert.NoError(t, err)
 
 	// assert some things about the deployment record:
@@ -197,7 +204,7 @@ func TestLoadTooNewDeployment(t *testing.T) {
 		Version: apitype.DeploymentSchemaVersionCurrent + 1,
 	}
 
-	deployment, err := DeserializeUntypedDeployment(ctx, untypedDeployment, DefaultSecretsProvider)
+	deployment, err := DeserializeUntypedDeployment(ctx, untypedDeployment, b64.Base64SecretsProvider)
 	assert.Nil(t, deployment)
 	assert.Error(t, err)
 	assert.Equal(t, ErrDeploymentSchemaVersionTooNew, err)
@@ -211,7 +218,7 @@ func TestLoadTooOldDeployment(t *testing.T) {
 		Version: DeploymentSchemaVersionOldestSupported - 1,
 	}
 
-	deployment, err := DeserializeUntypedDeployment(ctx, untypedDeployment, DefaultSecretsProvider)
+	deployment, err := DeserializeUntypedDeployment(ctx, untypedDeployment, b64.Base64SecretsProvider)
 	assert.Nil(t, deployment)
 	assert.Error(t, err)
 	assert.Equal(t, ErrDeploymentSchemaVersionTooOld, err)
@@ -223,7 +230,7 @@ func TestUnsupportedSecret(t *testing.T) {
 	rawProp := map[string]interface{}{
 		resource.SigKey: resource.SecretSig,
 	}
-	_, err := DeserializePropertyValue(rawProp, config.NewPanicCrypter(), config.NewPanicCrypter())
+	_, err := DeserializePropertyValue(rawProp, config.NewPanicCrypter())
 	assert.Error(t, err)
 }
 
@@ -233,7 +240,7 @@ func TestUnknownSig(t *testing.T) {
 	rawProp := map[string]interface{}{
 		resource.SigKey: "foobar",
 	}
-	_, err := DeserializePropertyValue(rawProp, config.NewPanicCrypter(), config.NewPanicCrypter())
+	_, err := DeserializePropertyValue(rawProp, config.NewPanicCrypter())
 	assert.Error(t, err)
 }
 
@@ -266,7 +273,7 @@ func TestDeserializeResourceReferencePropertyValueID(t *testing.T) {
 		"custom-resource-unknown-id": serialize(resource.MakeCustomResourceReference("urn3", "", "3.4.5")),
 	}
 
-	deserialized, err := DeserializePropertyValue(serialized, config.NewPanicCrypter(), config.NewPanicCrypter())
+	deserialized, err := DeserializePropertyValue(serialized, config.NewPanicCrypter())
 	assert.NoError(t, err)
 
 	assert.Equal(t, resource.NewPropertyValue(map[string]interface{}{
@@ -279,7 +286,7 @@ func TestDeserializeResourceReferencePropertyValueID(t *testing.T) {
 func TestCustomSerialization(t *testing.T) {
 	t.Parallel()
 
-	textAsset, err := resource.NewTextAsset("alpha beta gamma")
+	textAsset, err := rasset.FromText("alpha beta gamma")
 	assert.NoError(t, err)
 
 	strProp := resource.NewStringProperty("strProp")
@@ -376,7 +383,7 @@ func TestCustomSerialization(t *testing.T) {
 	t.Run("SerializeProperties", func(t *testing.T) {
 		t.Parallel()
 
-		serializedPropMap, err := SerializeProperties(propMap, config.BlindingCrypter, false /* showSecrets */)
+		serializedPropMap, err := SerializeProperties(context.Background(), propMap, config.BlindingCrypter, false /* showSecrets */)
 		assert.NoError(t, err)
 
 		// Now JSON encode the results?
@@ -442,7 +449,7 @@ func TestDeserializeDeploymentSecretCache(t *testing.T) {
 				ID:     "vol-044ba5ad2bd959bc1",
 			},
 		},
-	}, DefaultSecretsProvider)
+	}, b64.Base64SecretsProvider)
 	assert.NoError(t, err)
 }
 
@@ -454,10 +461,9 @@ func TestDeserializeInvalidResourceErrors(t *testing.T) {
 		Resources: []apitype.ResourceV3{
 			{},
 		},
-	}, DefaultSecretsProvider)
+	}, b64.Base64SecretsProvider)
 	assert.Nil(t, deployment)
-	assert.Error(t, err)
-	assert.Equal(t, "resource missing required 'urn' field", err.Error())
+	assert.EqualError(t, err, "resource missing required 'urn' field")
 
 	urn := "urn:pulumi:prod::acme::acme:erp:Backend$aws:ebs/volume:Volume::PlatformBackendDb"
 
@@ -467,10 +473,9 @@ func TestDeserializeInvalidResourceErrors(t *testing.T) {
 				URN: resource.URN(urn),
 			},
 		},
-	}, DefaultSecretsProvider)
+	}, b64.Base64SecretsProvider)
 	assert.Nil(t, deployment)
-	assert.Error(t, err)
-	assert.Equal(t, fmt.Sprintf("resource '%s' missing required 'type' field", urn), err.Error())
+	assert.EqualError(t, err, fmt.Sprintf("resource '%s' missing required 'type' field", urn))
 
 	deployment, err = DeserializeDeploymentV3(ctx, apitype.DeploymentV3{
 		Resources: []apitype.ResourceV3{
@@ -481,20 +486,94 @@ func TestDeserializeInvalidResourceErrors(t *testing.T) {
 				ID:     "vol-044ba5ad2bd959bc1",
 			},
 		},
-	}, DefaultSecretsProvider)
+	}, b64.Base64SecretsProvider)
 	assert.Nil(t, deployment)
-	assert.Error(t, err)
-	assert.Equal(t, fmt.Sprintf("resource '%s' has 'custom' false but non-empty ID", urn), err.Error())
+	assert.EqualError(t, err, fmt.Sprintf("resource '%s' has 'custom' false but non-empty ID", urn))
+}
+
+func TestDeserializeMissingSecretsManager(t *testing.T) {
+	t.Parallel()
+
+	urn := "urn:pulumi:urn:pulumi:test_stack::test_project::pkg:index:type::name"
+	ctx := context.Background()
+	deployment, err := DeserializeDeploymentV3(ctx, apitype.DeploymentV3{
+		Resources: []apitype.ResourceV3{
+			{
+				URN:  resource.URN(urn),
+				Type: "pkg:index:type",
+				Outputs: map[string]interface{}{
+					"secret": map[string]interface{}{
+						"4dabf18193072939515e22adb298388d": "1b47061264138c4ac30d75fd1eb44270",
+						"ciphertext":                       "v1:xRi3+sQJSJHR8sha:RM8BfzSAJI84QMl+zLGjzPvwSqV6zOSdd/I/V34h",
+					},
+				},
+			},
+		},
+	}, b64.Base64SecretsProvider)
+	assert.Nil(t, deployment)
+	assert.EqualError(t, err, "snapshot contains encrypted secrets but no secrets manager could be found")
+
+	deployment, err = DeserializeDeploymentV3(ctx, apitype.DeploymentV3{
+		Resources: []apitype.ResourceV3{
+			{
+				URN:  resource.URN(urn),
+				Type: "pkg:index:type",
+			},
+		},
+	}, b64.Base64SecretsProvider)
+	require.NoError(t, err)
+	assert.Equal(t, deployment, &deploy.Snapshot{
+		Manifest: deploy.Manifest{
+			Time:    time.Time{},
+			Version: "",
+			Plugins: nil,
+		},
+		SecretsManager: nil,
+		Resources: []*resource.State{
+			{
+				Type:         "pkg:index:type",
+				URN:          resource.URN(urn),
+				Custom:       false,
+				Delete:       false,
+				ID:           "",
+				Inputs:       resource.PropertyMap{},
+				Outputs:      resource.PropertyMap{},
+				Parent:       "",
+				Protect:      false,
+				Dependencies: nil,
+			},
+		},
+		PendingOperations: nil,
+	})
 }
 
 func TestSerializePropertyValue(t *testing.T) {
 	t.Parallel()
 
+	ctx := context.Background()
 	rapid.Check(t, func(t *rapid.T) {
-		v := resource_testing.PropertyValueGenerator(6).Draw(t, "property value").(resource.PropertyValue)
-		_, err := SerializePropertyValue(v, config.NopEncrypter, false)
+		v := resource_testing.PropertyValueGenerator(6).Draw(t, "property value")
+		_, err := SerializePropertyValue(ctx, v, config.NopEncrypter, false)
 		assert.NoError(t, err)
 	})
+}
+
+// Test that if ShowSecrets is set the encrypter is not called into at all.
+func TestSerializePropertyValue_ShowSecrets(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	crypter := config.NewPanicCrypter()
+
+	secret := resource.MakeSecret(resource.NewStringProperty("secret"))
+	_, err := SerializePropertyValue(ctx, secret, crypter, true)
+	assert.NoError(t, err)
+
+	secret = resource.MakeSecret(resource.NewArrayProperty([]resource.PropertyValue{
+		resource.MakeSecret(resource.NewStringProperty("secret")),
+	}))
+	_, err = SerializePropertyValue(ctx, secret, crypter, true)
+	assert.NoError(t, err)
 }
 
 func TestDeserializePropertyValue(t *testing.T) {
@@ -502,13 +581,13 @@ func TestDeserializePropertyValue(t *testing.T) {
 
 	rapid.Check(t, func(t *rapid.T) {
 		v := ObjectValueGenerator(6).Draw(t, "property value")
-		_, err := DeserializePropertyValue(v, config.NopDecrypter, config.NopEncrypter)
+		_, err := DeserializePropertyValue(v, config.NopDecrypter)
 		assert.NoError(t, err)
 	})
 }
 
 func wireValue(v resource.PropertyValue) (interface{}, error) {
-	object, err := SerializePropertyValue(v, config.NopEncrypter, false)
+	object, err := SerializePropertyValue(context.Background(), v, config.NopEncrypter, false)
 	if err != nil {
 		return nil, err
 	}
@@ -531,7 +610,7 @@ func TestPropertyValueSchema(t *testing.T) {
 
 	//nolint:paralleltest // uses rapid.T not golang testing.T
 	t.Run("serialized", rapid.MakeCheck(func(t *rapid.T) {
-		wireObject, err := wireValue(resource_testing.PropertyValueGenerator(6).Draw(t, "property value").(resource.PropertyValue))
+		wireObject, err := wireValue(resource_testing.PropertyValueGenerator(6).Draw(t, "property value"))
 		require.NoError(t, err)
 
 		err = propertyValueSchema.Validate(wireObject)
@@ -570,11 +649,11 @@ func TestRoundTripPropertyValue(t *testing.T) {
 	t.Parallel()
 
 	rapid.Check(t, func(t *rapid.T) {
-		original := resource_testing.PropertyValueGenerator(6).Draw(t, "property value").(resource.PropertyValue)
+		original := resource_testing.PropertyValueGenerator(6).Draw(t, "property value")
 		wireObject, err := wireValue(original)
 		require.NoError(t, err)
 
-		deserialized, err := DeserializePropertyValue(wireObject, config.NopDecrypter, config.NopEncrypter)
+		deserialized, err := DeserializePropertyValue(wireObject, config.NopDecrypter)
 		require.NoError(t, err)
 
 		resource_testing.AssertEqualPropertyValues(t, replaceOutputsWithComputed(original), deserialized)
@@ -582,36 +661,36 @@ func TestRoundTripPropertyValue(t *testing.T) {
 }
 
 // UnknownObjectGenerator generates the unknown object value.
-func UnknownObjectGenerator() *rapid.Generator {
+func UnknownObjectGenerator() *rapid.Generator[any] {
 	return rapid.Custom(func(t *rapid.T) interface{} {
 		return rapid.Just(computedValuePlaceholder).Draw(t, "unknowns")
 	})
 }
 
 // BoolObjectGenerator generates boolean object values.
-func BoolObjectGenerator() *rapid.Generator {
-	return rapid.Custom(func(t *rapid.T) interface{} {
+func BoolObjectGenerator() *rapid.Generator[bool] {
+	return rapid.Custom(func(t *rapid.T) bool {
 		return rapid.Bool().Draw(t, "booleans")
 	})
 }
 
 // NumberObjectGenerator generates numeric object values.
-func NumberObjectGenerator() *rapid.Generator {
-	return rapid.Custom(func(t *rapid.T) interface{} {
+func NumberObjectGenerator() *rapid.Generator[float64] {
+	return rapid.Custom(func(t *rapid.T) float64 {
 		return rapid.Float64().Draw(t, "numbers")
 	})
 }
 
 // StringObjectGenerator generates string object values.
-func StringObjectGenerator() *rapid.Generator {
-	return rapid.Custom(func(t *rapid.T) interface{} {
+func StringObjectGenerator() *rapid.Generator[string] {
+	return rapid.Custom(func(t *rapid.T) string {
 		return rapid.String().Draw(t, "strings")
 	})
 }
 
 // TextAssetObjectGenerator generates textual asset object values.
-func TextAssetObjectGenerator() *rapid.Generator {
-	return rapid.Custom(func(t *rapid.T) interface{} {
+func TextAssetObjectGenerator() *rapid.Generator[map[string]any] {
+	return rapid.Custom(func(t *rapid.T) map[string]any {
 		return map[string]interface{}{
 			resource.SigKey:            resource.AssetSig,
 			resource.AssetTextProperty: rapid.String().Draw(t, "text asset contents"),
@@ -620,16 +699,21 @@ func TextAssetObjectGenerator() *rapid.Generator {
 }
 
 // AssetObjectGenerator generates asset object values.
-func AssetObjectGenerator() *rapid.Generator {
+func AssetObjectGenerator() *rapid.Generator[map[string]any] {
 	return TextAssetObjectGenerator()
 }
 
 // LiteralArchiveObjectGenerator generates archive object values with literal archive contents.
-func LiteralArchiveObjectGenerator(maxDepth int) *rapid.Generator {
+func LiteralArchiveObjectGenerator(maxDepth int) *rapid.Generator[map[string]any] {
 	return rapid.Custom(func(t *rapid.T) map[string]interface{} {
-		var contentsGenerator *rapid.Generator
+		var contentsGenerator *rapid.Generator[map[string]any]
 		if maxDepth > 0 {
-			contentsGenerator = rapid.MapOfN(rapid.StringMatching(`^(/[^[:cntrl:]/]+)*/?[^[:cntrl:]/]+$`), rapid.OneOf(AssetObjectGenerator(), ArchiveObjectGenerator(maxDepth-1)), 0, 16)
+			contentsGenerator = rapid.MapOfN(
+				rapid.StringMatching(`^(/[^[:cntrl:]/]+)*/?[^[:cntrl:]/]+$`),
+				rapid.OneOf(
+					AssetObjectGenerator().AsAny(),
+					ArchiveObjectGenerator(maxDepth-1).AsAny(),
+				), 0, 16)
 		} else {
 			contentsGenerator = rapid.Just(map[string]interface{}{})
 		}
@@ -642,20 +726,23 @@ func LiteralArchiveObjectGenerator(maxDepth int) *rapid.Generator {
 }
 
 // ArchiveObjectGenerator generates archive object values.
-func ArchiveObjectGenerator(maxDepth int) *rapid.Generator {
+func ArchiveObjectGenerator(maxDepth int) *rapid.Generator[map[string]any] {
 	return LiteralArchiveObjectGenerator(maxDepth)
 }
 
 // ResourceReferenceObjectGenerator generates resource reference object values.
-func ResourceReferenceObjectGenerator() *rapid.Generator {
+func ResourceReferenceObjectGenerator() *rapid.Generator[any] {
 	return rapid.Custom(func(t *rapid.T) interface{} {
 		fields := map[string]interface{}{
 			resource.SigKey:  resource.ResourceReferenceSig,
-			"urn":            string(resource_testing.URNGenerator().Draw(t, "referenced URN").(resource.URN)),
+			"urn":            string(resource_testing.URNGenerator().Draw(t, "referenced URN")),
 			"packageVersion": resource_testing.SemverStringGenerator().Draw(t, "package version"),
 		}
 
-		id := rapid.OneOf(UnknownObjectGenerator(), StringObjectGenerator()).Draw(t, "referenced ID")
+		id := rapid.OneOf(
+			UnknownObjectGenerator(),
+			StringObjectGenerator().AsAny(),
+		).Draw(t, "referenced ID")
 		if idstr := id.(string); idstr != "" && idstr != computedValuePlaceholder {
 			fields["id"] = id
 		}
@@ -666,24 +753,24 @@ func ResourceReferenceObjectGenerator() *rapid.Generator {
 
 // ArrayObjectGenerator generates array object values. The maxDepth parameter controls the maximum
 // depth of the elements of the array.
-func ArrayObjectGenerator(maxDepth int) *rapid.Generator {
-	return rapid.Custom(func(t *rapid.T) interface{} {
+func ArrayObjectGenerator(maxDepth int) *rapid.Generator[[]any] {
+	return rapid.Custom(func(t *rapid.T) []any {
 		return rapid.SliceOfN(ObjectValueGenerator(maxDepth-1), 0, 32).Draw(t, "array elements")
 	})
 }
 
 // MapObjectGenerator generates map object values. The maxDepth parameter controls the maximum
 // depth of the elements of the map.
-func MapObjectGenerator(maxDepth int) *rapid.Generator {
-	return rapid.Custom(func(t *rapid.T) interface{} {
+func MapObjectGenerator(maxDepth int) *rapid.Generator[map[string]any] {
+	return rapid.Custom(func(t *rapid.T) map[string]any {
 		return rapid.MapOfN(rapid.String(), ObjectValueGenerator(maxDepth-1), 0, 32).Draw(t, "map elements")
 	})
 }
 
 // SecretObjectGenerator generates secret object values. The maxDepth parameter controls the maximum
 // depth of the plaintext value of the secret, if any.
-func SecretObjectGenerator(maxDepth int) *rapid.Generator {
-	return rapid.Custom(func(t *rapid.T) interface{} {
+func SecretObjectGenerator(maxDepth int) *rapid.Generator[map[string]any] {
+	return rapid.Custom(func(t *rapid.T) map[string]any {
 		value := ObjectValueGenerator(maxDepth-1).Draw(t, "secret element")
 		bytes, err := json.Marshal(value)
 		require.NoError(t, err)
@@ -697,21 +784,21 @@ func SecretObjectGenerator(maxDepth int) *rapid.Generator {
 
 // ObjectValueGenerator generates arbitrary object values. The maxDepth parameter controls the maximum
 // number of times the generator may recur.
-func ObjectValueGenerator(maxDepth int) *rapid.Generator {
-	choices := []*rapid.Generator{
+func ObjectValueGenerator(maxDepth int) *rapid.Generator[any] {
+	choices := []*rapid.Generator[any]{
 		UnknownObjectGenerator(),
-		BoolObjectGenerator(),
-		NumberObjectGenerator(),
-		StringObjectGenerator(),
-		AssetObjectGenerator(),
+		BoolObjectGenerator().AsAny(),
+		NumberObjectGenerator().AsAny(),
+		StringObjectGenerator().AsAny(),
+		AssetObjectGenerator().AsAny(),
 		ResourceReferenceObjectGenerator(),
 	}
 	if maxDepth > 0 {
 		choices = append(choices,
-			ArchiveObjectGenerator(maxDepth),
-			ArrayObjectGenerator(maxDepth),
-			MapObjectGenerator(maxDepth),
-			SecretObjectGenerator(maxDepth))
+			ArchiveObjectGenerator(maxDepth).AsAny(),
+			ArrayObjectGenerator(maxDepth).AsAny(),
+			MapObjectGenerator(maxDepth).AsAny(),
+			SecretObjectGenerator(maxDepth).AsAny())
 	}
 	return rapid.OneOf(choices...)
 }

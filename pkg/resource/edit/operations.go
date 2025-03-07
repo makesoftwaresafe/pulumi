@@ -1,4 +1,4 @@
-// Copyright 2016-2022, Pulumi Corporation.
+// Copyright 2016-2023, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,12 +15,12 @@
 package edit
 
 import (
-	"fmt"
-
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy/providers"
 	"github.com/pulumi/pulumi/pkg/v3/resource/graph"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
@@ -42,8 +42,8 @@ func DeleteResource(
 	snapshot *deploy.Snapshot, condemnedRes *resource.State,
 	onProtected func(*resource.State) error, targetDependents bool,
 ) error {
-	contract.Require(snapshot != nil, "snapshot")
-	contract.Require(condemnedRes != nil, "state")
+	contract.Requiref(snapshot != nil, "snapshot", "must not be nil")
+	contract.Requiref(condemnedRes != nil, "condemnedRes", "must not be nil")
 
 	handleProtected := func(res *resource.State) error {
 		if !res.Protect {
@@ -70,42 +70,39 @@ func DeleteResource(
 		}
 		numSameURN++
 	}
-
-	deleteSet := map[resource.URN]struct{}{}
-
 	isUniqueURN := numSameURN <= 1
-	// If there's only one resource (or fewer), determine dependencies to be deleted from state.
-	if isUniqueURN {
-		// condemnedRes.URN is unique. We can safely delete it by URN.
-		deleteSet[condemnedRes.URN] = struct{}{}
-		dg := graph.NewDependencyGraph(snapshot.Resources)
 
-		if deps := dg.DependingOn(condemnedRes, nil, true); len(deps) != 0 {
-			if !targetDependents {
-				return ResourceHasDependenciesError{Condemned: condemnedRes, Dependencies: deps}
+	deleteSet := make(map[resource.URN][]*resource.State)
+	dg := graph.NewDependencyGraph(snapshot.Resources)
+
+	deps := dg.OnlyDependsOn(condemnedRes)
+	if len(deps) != 0 {
+		if !targetDependents {
+			return ResourceHasDependenciesError{Condemned: condemnedRes, Dependencies: deps}
+		}
+		for _, dep := range deps {
+			if err := handleProtected(dep); err != nil {
+				return err
 			}
-			for _, dep := range deps {
-				if err := handleProtected(dep); err != nil {
-					return err
-				}
-				deleteSet[dep.URN] = struct{}{}
-			}
+			deleteSet[dep.URN] = append(deleteSet[dep.URN], dep)
 		}
 	}
 
 	// If there are no resources that depend on condemnedRes, iterate through the snapshot and keep everything that's
 	// not condemnedRes.
-	newSnapshot := make([]*resource.State, 0, len(snapshot.Resources))
+	newSnapshot := slice.Prealloc[*resource.State](len(snapshot.Resources))
 	var children []*resource.State
+search:
 	for _, res := range snapshot.Resources {
 		if res == condemnedRes {
 			// Skip condemned resource.
 			continue
 		}
 
-		if _, inDeleteSet := deleteSet[res.URN]; inDeleteSet {
-			//  Skip resources to be deleted.
-			continue
+		for _, v := range deleteSet[res.URN] {
+			if v == res {
+				continue search
+			}
 		}
 
 		// While iterating, keep track of the set of resources that are parented to our
@@ -116,7 +113,6 @@ func DeleteResource(
 		}
 
 		newSnapshot = append(newSnapshot, res)
-
 	}
 
 	// If condemnedRes is unique and there exists a resource that is the child of condemnedRes,
@@ -152,10 +148,10 @@ func LocateResource(snap *deploy.Snapshot, urn resource.URN) []*resource.State {
 	return resources
 }
 
-// RenameStack changes the `stackName` component of every URN in a snapshot. In addition, it rewrites the name of
+// RenameStack changes the `stackName` component of every URN in a deployment. In addition, it rewrites the name of
 // the root Stack resource itself. May optionally change the project/package name as well.
-func RenameStack(snap *deploy.Snapshot, newName tokens.Name, newProject tokens.PackageName) error {
-	contract.Require(snap != nil, "snap")
+func RenameStack(deployment *apitype.DeploymentV3, newName tokens.StackName, newProject tokens.PackageName) error {
+	contract.Requiref(deployment != nil, "deployment", "must not be nil")
 
 	rewriteUrn := func(u resource.URN) resource.URN {
 		project := u.Project()
@@ -165,15 +161,15 @@ func RenameStack(snap *deploy.Snapshot, newName tokens.Name, newProject tokens.P
 
 		// The pulumi:pulumi:Stack resource's name component is of the form `<project>-<stack>` so we want
 		// to rename the name portion as well.
-		if u.QualifiedType() == "pulumi:pulumi:Stack" {
-			return resource.NewURN(newName.Q(), project, "", u.QualifiedType(), tokens.QName(project)+"-"+newName.Q())
+		if u.QualifiedType() == resource.RootStackType {
+			return resource.NewURN(newName.Q(), project, "", u.QualifiedType(), string(tokens.QName(project)+"-"+newName.Q()))
 		}
 
-		return resource.NewURN(newName.Q(), project, "", u.QualifiedType(), u.Name())
+		return resource.NewURN(tokens.QName(newName.String()), project, "", u.QualifiedType(), u.Name())
 	}
 
-	rewriteState := func(res *resource.State) {
-		contract.Assert(res != nil)
+	rewriteState := func(res *apitype.ResourceV3) {
+		contract.Assertf(res != nil, "resource state must not be nil")
 
 		res.URN = rewriteUrn(res.URN)
 
@@ -191,6 +187,10 @@ func RenameStack(snap *deploy.Snapshot, newName tokens.Name, newProject tokens.P
 			}
 		}
 
+		if res.DeletedWith != "" {
+			res.DeletedWith = rewriteUrn(res.DeletedWith)
+		}
+
 		if res.Provider != "" {
 			providerRef, err := providers.ParseReference(res.Provider)
 			contract.AssertNoErrorf(err, "failed to parse provider reference from validated checkpoint")
@@ -202,16 +202,12 @@ func RenameStack(snap *deploy.Snapshot, newName tokens.Name, newProject tokens.P
 		}
 	}
 
-	if err := snap.VerifyIntegrity(); err != nil {
-		return fmt.Errorf("checkpoint is invalid: %w", err)
+	for i := range deployment.Resources {
+		rewriteState(&deployment.Resources[i])
 	}
 
-	for _, res := range snap.Resources {
-		rewriteState(res)
-	}
-
-	for _, ops := range snap.PendingOperations {
-		rewriteState(ops.Resource)
+	for i := range deployment.PendingOperations {
+		rewriteState(&deployment.PendingOperations[i].Resource)
 	}
 
 	return nil

@@ -19,10 +19,11 @@ import (
 	"encoding/binary"
 	"io"
 
-	pbempty "github.com/golang/protobuf/ptypes/empty"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/encoding/proto"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
@@ -109,7 +110,6 @@ func servePipes(ctx context.Context, pipes pipes, target pulumirpc.ResourceMonit
 
 				logging.V(10).Infof("Sync invoke: Invoking: %s", req.GetTok())
 				res, err := target.Invoke(ctx, &req)
-
 				// Unfortunately, `monitor.Invoke` can return errors for non-exceptional cases. This
 				// can happen, for example, if the underlying provider call ends up returning an
 				// error itself.  A common case of this is the aws-provider which will often return
@@ -154,6 +154,7 @@ func servePipes(ctx context.Context, pipes pipes, target pulumirpc.ResourceMonit
 
 				// write the 4-byte response length
 				logging.V(10).Infoln("Sync invoke: Writing length to request pipe")
+				//nolint:gosec // Max message size for protobuf is 2GB, so the int -> uint32 conversion is safe.
 				if err := binary.Write(pipes.writer(), binary.BigEndian, uint32(len(resBytes))); err != nil {
 					logging.V(10).Infof("Sync invoke: Error writing length to pipe: %s\n", err)
 					return err
@@ -183,19 +184,20 @@ func servePipes(ctx context.Context, pipes pipes, target pulumirpc.ResourceMonit
 // perform.
 
 type monitorProxy struct {
-	pulumirpc.UnimplementedResourceMonitorServer
+	pulumirpc.UnsafeResourceMonitorServer
 
 	target pulumirpc.ResourceMonitorClient
 }
 
 func (p *monitorProxy) Invoke(
-	ctx context.Context, req *pulumirpc.ResourceInvokeRequest) (*pulumirpc.InvokeResponse, error) {
+	ctx context.Context, req *pulumirpc.ResourceInvokeRequest,
+) (*pulumirpc.InvokeResponse, error) {
 	return p.target.Invoke(ctx, req)
 }
 
 func (p *monitorProxy) StreamInvoke(
-	req *pulumirpc.ResourceInvokeRequest, server pulumirpc.ResourceMonitor_StreamInvokeServer) error {
-
+	req *pulumirpc.ResourceInvokeRequest, server pulumirpc.ResourceMonitor_StreamInvokeServer,
+) error {
 	client, err := p.target.StreamInvoke(context.Background(), req)
 	if err != nil {
 		return err
@@ -217,26 +219,54 @@ func (p *monitorProxy) StreamInvoke(
 }
 
 func (p *monitorProxy) Call(
-	ctx context.Context, req *pulumirpc.CallRequest) (*pulumirpc.CallResponse, error) {
+	ctx context.Context, req *pulumirpc.ResourceCallRequest,
+) (*pulumirpc.CallResponse, error) {
 	return p.target.Call(ctx, req)
 }
 
 func (p *monitorProxy) ReadResource(
-	ctx context.Context, req *pulumirpc.ReadResourceRequest) (*pulumirpc.ReadResourceResponse, error) {
+	ctx context.Context, req *pulumirpc.ReadResourceRequest,
+) (*pulumirpc.ReadResourceResponse, error) {
 	return p.target.ReadResource(ctx, req)
 }
 
 func (p *monitorProxy) RegisterResource(
-	ctx context.Context, req *pulumirpc.RegisterResourceRequest) (*pulumirpc.RegisterResourceResponse, error) {
+	ctx context.Context, req *pulumirpc.RegisterResourceRequest,
+) (*pulumirpc.RegisterResourceResponse, error) {
+	// Add the "pulumi-runtime" header to the context so the engine can detect this request
+	// is coming from the nodejs language plugin.
+	// Setting this header is not required for other SDKs. We do it for nodejs so the engine
+	// can workaround a bug in older Node.js SDKs where alias specs weren't specified correctly.
+	ctx = metadata.AppendToOutgoingContext(ctx, "pulumi-runtime", "nodejs")
 	return p.target.RegisterResource(ctx, req)
 }
 
 func (p *monitorProxy) RegisterResourceOutputs(
-	ctx context.Context, req *pulumirpc.RegisterResourceOutputsRequest) (*pbempty.Empty, error) {
+	ctx context.Context, req *pulumirpc.RegisterResourceOutputsRequest,
+) (*emptypb.Empty, error) {
 	return p.target.RegisterResourceOutputs(ctx, req)
 }
 
 func (p *monitorProxy) SupportsFeature(
-	ctx context.Context, req *pulumirpc.SupportsFeatureRequest) (*pulumirpc.SupportsFeatureResponse, error) {
+	ctx context.Context, req *pulumirpc.SupportsFeatureRequest,
+) (*pulumirpc.SupportsFeatureResponse, error) {
 	return p.target.SupportsFeature(ctx, req)
+}
+
+func (p *monitorProxy) RegisterStackTransform(
+	ctx context.Context, req *pulumirpc.Callback,
+) (*emptypb.Empty, error) {
+	return p.target.RegisterStackTransform(ctx, req)
+}
+
+func (p *monitorProxy) RegisterStackInvokeTransform(
+	ctx context.Context, req *pulumirpc.Callback,
+) (*emptypb.Empty, error) {
+	return p.target.RegisterStackInvokeTransform(ctx, req)
+}
+
+func (p *monitorProxy) RegisterPackage(
+	ctx context.Context, req *pulumirpc.RegisterPackageRequest,
+) (*pulumirpc.RegisterPackageResponse, error) {
+	return p.target.RegisterPackage(ctx, req)
 }

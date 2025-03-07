@@ -24,8 +24,10 @@
 //
 // The code can prepend `--logtostderr` and verbosity e.g. `-v=9`
 // arguments. We ignore these for the moment.
-/** @internal */
-export function parseArgs(args: string[]): ({engineAddress: string} | undefined) {
+/**
+ * @internal
+ */
+export function parseArgs(args: string[]): { engineAddress: string } | undefined {
     const cleanArgs = [];
 
     for (let i = 0; i < args.length; i++) {
@@ -47,5 +49,5 @@ export function parseArgs(args: string[]): ({engineAddress: string} | undefined)
         return undefined;
     }
 
-    return {engineAddress: cleanArgs[0]};
+    return { engineAddress: cleanArgs[0] };
 }

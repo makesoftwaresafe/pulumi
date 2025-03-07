@@ -17,6 +17,10 @@ package deploytest
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
@@ -26,6 +30,8 @@ import (
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 type ResourceMonitor struct {
@@ -38,7 +44,7 @@ type ResourceMonitor struct {
 
 func dialMonitor(ctx context.Context, endpoint string) (*ResourceMonitor, error) {
 	// Connect to the resource monitor and create an appropriate client.
-	conn, err := grpc.Dial(
+	conn, err := grpc.NewClient(
 		endpoint,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		rpcutil.GrpcChannelOptions(),
@@ -52,12 +58,12 @@ func dialMonitor(ctx context.Context, endpoint string) (*ResourceMonitor, error)
 	supportsSecrets, err := supportsFeature(ctx, resmon, "secrets")
 	if err != nil {
 		contract.IgnoreError(conn.Close())
-		return nil, err
+		return nil, fmt.Errorf("could not determine whether secrets are supported: %w", err)
 	}
 	supportsResourceReferences, err := supportsFeature(ctx, resmon, "resourceReferences")
 	if err != nil {
 		contract.IgnoreError(conn.Close())
-		return nil, err
+		return nil, fmt.Errorf("could not determine whether resource references are supported: %w", err)
 	}
 
 	// Fire up a resource monitor client and return.
@@ -75,6 +81,37 @@ func supportsFeature(ctx context.Context, resmon pulumirpc.ResourceMonitorClient
 		return false, err
 	}
 	return resp.GetHasSupport(), nil
+}
+
+func parseSourcePosition(raw string) (*pulumirpc.SourcePosition, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	pos := pulumirpc.SourcePosition{
+		Uri: fmt.Sprintf("%v://%v", u.Scheme, u.Path),
+	}
+
+	line, col, _ := strings.Cut(u.Fragment, ",")
+	if line != "" {
+		l, err := strconv.ParseInt(line, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		//nolint:gosec // ParseInt will return an error if the size is too large.
+		pos.Line = int32(l)
+	}
+	if col != "" {
+		c, err := strconv.ParseInt(col, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		//nolint:gosec // ParseInt will return an error if the size is too large.
+		pos.Column = int32(c)
+	}
+
+	return &pos, nil
 }
 
 func (rm *ResourceMonitor) Close() error {
@@ -95,10 +132,11 @@ type ResourceOptions struct {
 	DeleteBeforeReplace     *bool
 	Version                 string
 	PluginDownloadURL       string
+	PluginChecksums         map[string][]byte
 	IgnoreChanges           []string
 	ReplaceOnChanges        []string
 	AliasURNs               []resource.URN
-	Aliases                 []resource.Alias
+	Aliases                 []*pulumirpc.Alias
 	ImportID                resource.ID
 	CustomTimeouts          *resource.CustomTimeouts
 	RetainOnDelete          bool
@@ -107,14 +145,42 @@ type ResourceOptions struct {
 	Remote                  bool
 	Providers               map[string]string
 	AdditionalSecretOutputs []resource.PropertyKey
+	AliasSpecs              bool
 
+	SourcePosition            string
 	DisableSecrets            bool
 	DisableResourceReferences bool
+	GrpcRequestHeaders        map[string]string
+
+	Transforms []*pulumirpc.Callback
+
+	SupportsResultReporting bool
+	PackageRef              string
+}
+
+func (rm *ResourceMonitor) unmarshalProperties(props *structpb.Struct) (resource.PropertyMap, error) {
+	// Note that `Keep*` flags are set to `true` so the caller can detect secrets, resource refs, etc that are
+	// erroneously returned (e.g. secrets/resource refs that are returned even though the caller has not set
+	// the relevant `Accept*` to `true` above).
+	return plugin.UnmarshalProperties(props, plugin.MarshalOptions{
+		KeepUnknowns:     true,
+		KeepSecrets:      true,
+		KeepResources:    true,
+		KeepOutputValues: true,
+	})
+}
+
+type RegisterResourceResponse struct {
+	URN          resource.URN
+	ID           resource.ID
+	Outputs      resource.PropertyMap
+	Dependencies map[resource.PropertyKey][]resource.URN
+	Result       pulumirpc.Result
 }
 
 func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom bool,
-	options ...ResourceOptions) (resource.URN, resource.ID, resource.PropertyMap, error) {
-
+	options ...ResourceOptions,
+) (*RegisterResourceResponse, error) {
 	var opts ResourceOptions
 	if len(options) > 0 {
 		opts = options[0]
@@ -125,12 +191,13 @@ func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom b
 
 	// marshal inputs
 	ins, err := plugin.MarshalProperties(opts.Inputs, plugin.MarshalOptions{
-		KeepUnknowns:  true,
-		KeepSecrets:   rm.supportsSecrets,
-		KeepResources: rm.supportsResourceReferences,
+		KeepUnknowns:     true,
+		KeepSecrets:      rm.supportsSecrets,
+		KeepResources:    rm.supportsResourceReferences,
+		KeepOutputValues: opts.Remote,
 	})
 	if err != nil {
-		return "", "", nil, err
+		return nil, err
 	}
 
 	// marshal dependencies
@@ -145,28 +212,6 @@ func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom b
 		aliasStrings = append(aliasStrings, string(a))
 	}
 
-	aliasObjects := []*pulumirpc.Alias{}
-	for _, a := range opts.Aliases {
-		var obj *pulumirpc.Alias
-		if a.URN == "" {
-			alias := &pulumirpc.Alias_Spec{
-				Name:    a.Name,
-				Type:    a.Type,
-				Project: a.Project,
-				Stack:   a.Stack,
-			}
-			if a.NoParent() {
-				alias.Parent = &pulumirpc.Alias_Spec_NoParent{NoParent: a.NoParent()}
-			} else if a.Parent != "" {
-				alias.Parent = &pulumirpc.Alias_Spec_ParentUrn{ParentUrn: string(a.Parent)}
-			}
-			obj = &pulumirpc.Alias{Alias: &pulumirpc.Alias_Spec_{Spec: alias}}
-		} else {
-			obj = &pulumirpc.Alias{Alias: &pulumirpc.Alias_Urn{Urn: string(a.URN)}}
-		}
-		aliasObjects = append(aliasObjects, obj)
-	}
-
 	inputDeps := make(map[string]*pulumirpc.RegisterResourceRequest_PropertyDependencies)
 	for pk, pd := range opts.PropertyDeps {
 		pdeps := []string{}
@@ -178,11 +223,13 @@ func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom b
 		}
 	}
 
-	var timeouts pulumirpc.RegisterResourceRequest_CustomTimeouts
+	var timeouts *pulumirpc.RegisterResourceRequest_CustomTimeouts
 	if opts.CustomTimeouts != nil {
-		timeouts.Create = prepareTestTimeout(opts.CustomTimeouts.Create)
-		timeouts.Update = prepareTestTimeout(opts.CustomTimeouts.Update)
-		timeouts.Delete = prepareTestTimeout(opts.CustomTimeouts.Delete)
+		timeouts = &pulumirpc.RegisterResourceRequest_CustomTimeouts{
+			Create: prepareTestTimeout(opts.CustomTimeouts.Create),
+			Update: prepareTestTimeout(opts.CustomTimeouts.Update),
+			Delete: prepareTestTimeout(opts.CustomTimeouts.Delete),
+		}
 	}
 
 	deleteBeforeReplace := false
@@ -197,6 +244,15 @@ func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom b
 	for i, v := range opts.AdditionalSecretOutputs {
 		additionalSecretOutputs[i] = string(v)
 	}
+
+	var sourcePosition *pulumirpc.SourcePosition
+	if opts.SourcePosition != "" {
+		sourcePosition, err = parseSourcePosition(opts.SourcePosition)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	requestInput := &pulumirpc.RegisterResourceRequest{
 		Type:                       string(t),
 		Name:                       name,
@@ -215,38 +271,57 @@ func (rm *ResourceMonitor) RegisterResource(t tokens.Type, name string, custom b
 		Version:                    opts.Version,
 		AliasURNs:                  aliasStrings,
 		ImportId:                   string(opts.ImportID),
-		CustomTimeouts:             &timeouts,
+		CustomTimeouts:             timeouts,
 		SupportsPartialValues:      supportsPartialValues,
 		Remote:                     opts.Remote,
 		ReplaceOnChanges:           opts.ReplaceOnChanges,
 		Providers:                  opts.Providers,
 		PluginDownloadURL:          opts.PluginDownloadURL,
+		PluginChecksums:            opts.PluginChecksums,
 		RetainOnDelete:             opts.RetainOnDelete,
 		AdditionalSecretOutputs:    additionalSecretOutputs,
-		Aliases:                    aliasObjects,
+		Aliases:                    opts.Aliases,
 		DeletedWith:                string(opts.DeletedWith),
+		AliasSpecs:                 opts.AliasSpecs,
+		SourcePosition:             sourcePosition,
+		Transforms:                 opts.Transforms,
+		SupportsResultReporting:    opts.SupportsResultReporting,
+		PackageRef:                 opts.PackageRef,
+	}
+
+	ctx := context.Background()
+	if len(opts.GrpcRequestHeaders) > 0 {
+		ctx = metadata.NewOutgoingContext(ctx, metadata.New(opts.GrpcRequestHeaders))
 	}
 
 	// submit request
-	resp, err := rm.resmon.RegisterResource(context.Background(), requestInput)
+	resp, err := rm.resmon.RegisterResource(ctx, requestInput)
 	if err != nil {
-		return "", "", nil, err
+		return nil, err
 	}
 	// unmarshal outputs
-	//
-	// Note that `KeepSecrets` and `KeepResources` are set to `true` so the caller can detect secrets and resource refs
-	// that are erroneously returned (e.g. secrets/resource refs that are returned even though the caller has not set
-	// `AcceptSecrets` or `AcceptResources` to `true` above).
-	outs, err := plugin.UnmarshalProperties(resp.Object, plugin.MarshalOptions{
-		KeepUnknowns:  true,
-		KeepSecrets:   true,
-		KeepResources: true,
-	})
+	outs, err := rm.unmarshalProperties(resp.Object)
 	if err != nil {
-		return "", "", nil, err
+		return nil, err
 	}
 
-	return resource.URN(resp.Urn), resource.ID(resp.Id), outs, nil
+	// unmarshal dependencies
+	depsMap := make(map[resource.PropertyKey][]resource.URN)
+	for k, p := range resp.PropertyDependencies {
+		var urns []resource.URN
+		for _, urn := range p.Urns {
+			urns = append(urns, resource.URN(urn))
+		}
+		depsMap[resource.PropertyKey(k)] = urns
+	}
+
+	return &RegisterResourceResponse{
+		URN:          resource.URN(resp.Urn),
+		ID:           resource.ID(resp.Id),
+		Outputs:      outs,
+		Dependencies: depsMap,
+		Result:       resp.Result,
+	}, nil
 }
 
 func (rm *ResourceMonitor) RegisterResourceOutputs(urn resource.URN, outputs resource.PropertyMap) error {
@@ -267,8 +342,8 @@ func (rm *ResourceMonitor) RegisterResourceOutputs(urn resource.URN, outputs res
 }
 
 func (rm *ResourceMonitor) ReadResource(t tokens.Type, name string, id resource.ID, parent resource.URN,
-	inputs resource.PropertyMap, provider string, version string) (resource.URN, resource.PropertyMap, error) {
-
+	inputs resource.PropertyMap, provider, version, sourcePosition string, packageRef string,
+) (resource.URN, resource.PropertyMap, error) {
 	// marshal inputs
 	ins, err := plugin.MarshalProperties(inputs, plugin.MarshalOptions{
 		KeepUnknowns:  true,
@@ -278,25 +353,32 @@ func (rm *ResourceMonitor) ReadResource(t tokens.Type, name string, id resource.
 		return "", nil, err
 	}
 
+	var sourcePos *pulumirpc.SourcePosition
+	if sourcePosition != "" {
+		sourcePos, err = parseSourcePosition(sourcePosition)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+
 	// submit request
 	resp, err := rm.resmon.ReadResource(context.Background(), &pulumirpc.ReadResourceRequest{
-		Type:       string(t),
-		Name:       name,
-		Id:         string(id),
-		Parent:     string(parent),
-		Provider:   provider,
-		Properties: ins,
-		Version:    version,
+		Type:           string(t),
+		Name:           name,
+		Id:             string(id),
+		Parent:         string(parent),
+		Provider:       provider,
+		Properties:     ins,
+		Version:        version,
+		SourcePosition: sourcePos,
+		PackageRef:     packageRef,
 	})
 	if err != nil {
 		return "", nil, err
 	}
 
 	// unmarshal outputs
-	outs, err := plugin.UnmarshalProperties(resp.Properties, plugin.MarshalOptions{
-		KeepUnknowns:  true,
-		KeepResources: true,
-	})
+	outs, err := rm.unmarshalProperties(resp.Properties)
 	if err != nil {
 		return "", nil, err
 	}
@@ -305,8 +387,8 @@ func (rm *ResourceMonitor) ReadResource(t tokens.Type, name string, id resource.
 }
 
 func (rm *ResourceMonitor) Invoke(tok tokens.ModuleMember, inputs resource.PropertyMap,
-	provider string, version string) (resource.PropertyMap, []*pulumirpc.CheckFailure, error) {
-
+	provider string, version string, packageRef string,
+) (resource.PropertyMap, []*pulumirpc.CheckFailure, error) {
 	// marshal inputs
 	ins, err := plugin.MarshalProperties(inputs, plugin.MarshalOptions{
 		KeepUnknowns:  true,
@@ -318,10 +400,11 @@ func (rm *ResourceMonitor) Invoke(tok tokens.ModuleMember, inputs resource.Prope
 
 	// submit request
 	resp, err := rm.resmon.Invoke(context.Background(), &pulumirpc.ResourceInvokeRequest{
-		Tok:      string(tok),
-		Provider: provider,
-		Args:     ins,
-		Version:  version,
+		Tok:        string(tok),
+		Provider:   provider,
+		Args:       ins,
+		Version:    version,
+		PackageRef: packageRef,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -333,10 +416,7 @@ func (rm *ResourceMonitor) Invoke(tok tokens.ModuleMember, inputs resource.Prope
 	}
 
 	// unmarshal outputs
-	outs, err := plugin.UnmarshalProperties(resp.Return, plugin.MarshalOptions{
-		KeepUnknowns:  true,
-		KeepResources: true,
-	})
+	outs, err := rm.unmarshalProperties(resp.Return)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -344,25 +424,41 @@ func (rm *ResourceMonitor) Invoke(tok tokens.ModuleMember, inputs resource.Prope
 	return outs, nil, nil
 }
 
-func (rm *ResourceMonitor) Call(tok tokens.ModuleMember, inputs resource.PropertyMap,
-	provider string, version string) (resource.PropertyMap, map[resource.PropertyKey][]resource.URN,
-	[]*pulumirpc.CheckFailure, error) {
-
+func (rm *ResourceMonitor) Call(
+	tok tokens.ModuleMember, args resource.PropertyMap, argDependencies map[resource.PropertyKey][]resource.URN,
+	provider string, version string, packageRef string) (resource.PropertyMap, map[resource.PropertyKey][]resource.URN,
+	[]*pulumirpc.CheckFailure, error,
+) {
 	// marshal inputs
-	ins, err := plugin.MarshalProperties(inputs, plugin.MarshalOptions{
-		KeepUnknowns:  true,
-		KeepResources: true,
+	mArgs, err := plugin.MarshalProperties(args, plugin.MarshalOptions{
+		KeepUnknowns:     true,
+		KeepResources:    true,
+		KeepSecrets:      true,
+		KeepOutputValues: true,
 	})
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
+	mArgDependencies := make(map[string]*pulumirpc.ResourceCallRequest_ArgumentDependencies)
+	for k, p := range argDependencies {
+		urns := make([]string, len(p))
+		for i, urn := range p {
+			urns[i] = string(urn)
+		}
+		mArgDependencies[string(k)] = &pulumirpc.ResourceCallRequest_ArgumentDependencies{
+			Urns: urns,
+		}
+	}
+
 	// submit request
-	resp, err := rm.resmon.Call(context.Background(), &pulumirpc.CallRequest{
-		Tok:      string(tok),
-		Provider: provider,
-		Args:     ins,
-		Version:  version,
+	resp, err := rm.resmon.Call(context.Background(), &pulumirpc.ResourceCallRequest{
+		Tok:             string(tok),
+		Provider:        provider,
+		Args:            mArgs,
+		ArgDependencies: mArgDependencies,
+		Version:         version,
+		PackageRef:      packageRef,
 	})
 	if err != nil {
 		return nil, nil, nil, err
@@ -374,10 +470,7 @@ func (rm *ResourceMonitor) Call(tok tokens.ModuleMember, inputs resource.Propert
 	}
 
 	// unmarshal outputs
-	outs, err := plugin.UnmarshalProperties(resp.Return, plugin.MarshalOptions{
-		KeepUnknowns:  true,
-		KeepResources: true,
-	})
+	outs, err := rm.unmarshalProperties(resp.Return)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -395,8 +488,35 @@ func (rm *ResourceMonitor) Call(tok tokens.ModuleMember, inputs resource.Propert
 	return outs, deps, nil, nil
 }
 
-func prepareTestTimeout(timeout float64) string {
-	mins := int(timeout) / 60
+func (rm *ResourceMonitor) RegisterStackTransform(callback *pulumirpc.Callback) error {
+	_, err := rm.resmon.RegisterStackTransform(context.Background(), callback)
+	return err
+}
 
-	return fmt.Sprintf("%dm", mins)
+func (rm *ResourceMonitor) RegisterStackInvokeTransform(callback *pulumirpc.Callback) error {
+	_, err := rm.resmon.RegisterStackInvokeTransform(context.Background(), callback)
+	return err
+}
+
+func (rm *ResourceMonitor) RegisterPackage(pkg, version, downloadURL string, checksums map[string][]byte,
+	parameterization *pulumirpc.Parameterization,
+) (string, error) {
+	resp, err := rm.resmon.RegisterPackage(context.Background(), &pulumirpc.RegisterPackageRequest{
+		Name:             pkg,
+		Version:          version,
+		DownloadUrl:      downloadURL,
+		Checksums:        checksums,
+		Parameterization: parameterization,
+	})
+	if err != nil {
+		return "", err
+	}
+	return resp.Ref, nil
+}
+
+func prepareTestTimeout(timeout float64) string {
+	if timeout == 0 {
+		return ""
+	}
+	return time.Duration(timeout * float64(time.Second)).String()
 }

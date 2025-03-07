@@ -14,19 +14,24 @@
 
 import assert from "assert";
 import * as semver from "semver";
+import * as tmp from "tmp";
 import * as upath from "upath";
+import * as fs from "fs";
 
 import {
+    CommandResult,
     ConfigMap,
     EngineEvent,
     fullyQualifiedStackName,
     LocalWorkspace,
+    LocalWorkspaceOptions,
     OutputMap,
     ProjectSettings,
+    ProjectRuntime,
+    PulumiCommand,
     Stack,
-    parseAndValidatePulumiVersion,
 } from "../../automation";
-import { Config, output } from "../../index";
+import { CustomResource, ComponentResource, ComponentResourceOptions, Config, output } from "../../index";
 import { getTestOrg, getTestSuffix } from "./util";
 
 const versionRegex = /(\d+\.)(\d+\.)(\d+)(-.*)?/;
@@ -35,30 +40,53 @@ const userAgent = "pulumi/pulumi/test";
 describe("LocalWorkspace", () => {
     it(`projectSettings from yaml/yml/json`, async () => {
         for (const ext of ["yaml", "yml", "json"]) {
-            const ws = await LocalWorkspace.create({ workDir: upath.joinSafe(__dirname, "data", ext) });
+            const ws = await LocalWorkspace.create(
+                withTestBackend(
+                    { workDir: upath.joinSafe(__dirname, "data", ext) },
+                    "testproj",
+                    "A minimal Go Pulumi program",
+                    "go",
+                ),
+            );
             const settings = await ws.projectSettings();
-            assert(settings.name, "testproj");
-            assert(settings.runtime, "go");
-            assert(settings.description, "A minimal Go Pulumi program");
+            assert.strictEqual(settings.name, "testproj");
+            assert.strictEqual(settings.runtime, "go");
+            assert.strictEqual(settings.description, "A minimal Go Pulumi program");
         }
     });
 
     it(`stackSettings from yaml/yml/json`, async () => {
         for (const ext of ["yaml", "yml", "json"]) {
-            const ws = await LocalWorkspace.create({ workDir: upath.joinSafe(__dirname, "data", ext) });
+            const ws = await LocalWorkspace.create(
+                withTestBackend({ workDir: upath.joinSafe(__dirname, "data", ext) }),
+            );
             const settings = await ws.stackSettings("dev");
             assert.strictEqual(settings.secretsProvider, "abc");
             assert.strictEqual(settings.config!["plain"], "plain");
             assert.strictEqual(settings.config!["secure"].secure, "secret");
+            await ws.saveStackSettings("dev", settings);
+            assert.strictEqual(settings.secretsProvider, "abc");
+        }
+    });
+
+    it(`fails gracefully for missing local workspace workDir`, async () => {
+        try {
+            const ws = await LocalWorkspace.create(withTestBackend({ workDir: "invalid-missing-workdir" }));
+            assert.fail("expected create with invalid workDir to throw");
+        } catch (err) {
+            assert.strictEqual(
+                err.toString(),
+                "Error: Invalid workDir passed to local workspace: 'invalid-missing-workdir' does not exist",
+            );
         }
     });
 
     it(`adds/removes/lists plugins successfully`, async () => {
-        const ws = await LocalWorkspace.create({});
-        await ws.installPlugin("aws", "v3.0.0");
+        const ws = await LocalWorkspace.create(withTestBackend({}));
+        await ws.installPlugin("aws", "v6.1.0");
         // See https://github.com/pulumi/pulumi/issues/11013 for why this is disabled
         //await ws.installPluginFromServer("scaleway", "v1.2.0", "github://api.github.com/lbrlabs");
-        await ws.removePlugin("aws", "3.0.0");
+        await ws.removePlugin("aws", "6.1.0");
         await ws.listPlugins();
     });
 
@@ -68,7 +96,7 @@ describe("LocalWorkspace", () => {
             name: projectName,
             runtime: "nodejs",
         };
-        const ws = await LocalWorkspace.create({ projectSettings });
+        const ws = await LocalWorkspace.create(withTestBackend({ projectSettings }));
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
         await ws.createStack(stackName);
         await ws.selectStack(stackName);
@@ -81,7 +109,7 @@ describe("LocalWorkspace", () => {
             name: projectName,
             runtime: "nodejs",
         };
-        const ws = await LocalWorkspace.create({ projectSettings });
+        const ws = await LocalWorkspace.create(withTestBackend({ projectSettings }));
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
         await Stack.create(stackName, ws);
         await Stack.select(stackName, ws);
@@ -91,24 +119,36 @@ describe("LocalWorkspace", () => {
     describe("Tag methods: get/set/remove/list", () => {
         const projectName = "testProjectName";
         const runtime = "nodejs";
-        const stackName = fullyQualifiedStackName(getTestOrg(), projectName, "testStack");
+        const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
         const projectSettings: ProjectSettings = {
             name: projectName,
             runtime,
         };
         let workspace: LocalWorkspace;
         beforeEach(async () => {
-            workspace = await LocalWorkspace.create({
-                projectSettings: projectSettings,
-            });
+            workspace = await LocalWorkspace.create(
+                withTestBackend({
+                    projectSettings: projectSettings,
+                }),
+            );
             await workspace.createStack(stackName);
         });
         it("lists tag values", async () => {
+            if (!process.env.PULUMI_ACCESS_TOKEN) {
+                console.log('Skipping "list tag values values" test');
+                // Skip the test because the local backend doesn't support tags
+                return;
+            }
             const result = await workspace.listTags(stackName);
             assert.strictEqual(result["pulumi:project"], projectName);
             assert.strictEqual(result["pulumi:runtime"], runtime);
         });
         it("sets and removes tag values", async () => {
+            if (!process.env.PULUMI_ACCESS_TOKEN) {
+                console.log('Skipping "sets and removes tag values" test');
+                // Skip the test because the local backend doesn't support tags
+                return;
+            }
             // sets
             await workspace.setTag(stackName, "foo", "bar");
             const actualValue = await workspace.getTag(stackName, "foo");
@@ -119,6 +159,11 @@ describe("LocalWorkspace", () => {
             assert.strictEqual(actualTags["foo"], undefined);
         });
         it("gets a single tag value", async () => {
+            if (!process.env.PULUMI_ACCESS_TOKEN) {
+                console.log('Skipping "gets a single tag value" test');
+                // Skip the test because the local backend doesn't support tags
+                return;
+            }
             const actualValue = await workspace.getTag(stackName, "pulumi:project");
             assert.strictEqual(actualValue, actualValue.trim());
             assert.strictEqual(actualValue, projectName);
@@ -127,13 +172,171 @@ describe("LocalWorkspace", () => {
             await workspace.removeStack(stackName);
         });
     });
+    describe("ListStack Methods", async () => {
+        describe("ListStacks", async () => {
+            const stackJson = `[
+                    {
+                        "name": "testorg1/testproj1/teststack1",
+                        "current": false,
+                        "url": "https://app.pulumi.com/testorg1/testproj1/teststack1"
+                    },
+                    {
+                        "name": "testorg1/testproj1/teststack2",
+                        "current": false,
+                        "url": "https://app.pulumi.com/testorg1/testproj1/teststack2"
+                    }
+                ]`;
+            it(`should handle stacks correctly for listStacks`, async () => {
+                const mockWithReturnedStacks = {
+                    command: "pulumi",
+                    version: null,
+                    run: async (args: string[], cwd: string, additionalEnv: { [key: string]: string }) => {
+                        return new CommandResult(stackJson, "", 0);
+                    },
+                };
+
+                const workspace = await LocalWorkspace.create(
+                    withTestBackend({ pulumiCommand: mockWithReturnedStacks }),
+                );
+                const stacks = await workspace.listStacks();
+
+                assert.strictEqual(stacks.length, 2);
+                assert.strictEqual(stacks[0].name, "testorg1/testproj1/teststack1");
+                assert.strictEqual(stacks[0].current, false);
+                assert.strictEqual(stacks[0].url, "https://app.pulumi.com/testorg1/testproj1/teststack1");
+                assert.strictEqual(stacks[1].name, "testorg1/testproj1/teststack2");
+                assert.strictEqual(stacks[1].current, false);
+                assert.strictEqual(stacks[1].url, "https://app.pulumi.com/testorg1/testproj1/teststack2");
+            });
+
+            it(`should use correct args for listStacks`, async () => {
+                let capturedArgs: string[] = [];
+                const mockPulumiCommand = {
+                    command: "pulumi",
+                    version: null,
+                    run: async (args: string[], cwd: string, additionalEnv: { [key: string]: string }) => {
+                        capturedArgs = args;
+                        return new CommandResult(stackJson, "", 0);
+                    },
+                };
+                const workspace = await LocalWorkspace.create(
+                    withTestBackend({
+                        pulumiCommand: mockPulumiCommand,
+                    }),
+                );
+                await workspace.listStacks();
+                assert.deepStrictEqual(capturedArgs, ["stack", "ls", "--json"]);
+            });
+        });
+
+        describe("ListStacks with all", async () => {
+            const stackJson = `[
+                    {
+                        "name": "testorg1/testproj1/teststack1",
+                        "current": false,
+                        "url": "https://app.pulumi.com/testorg1/testproj1/teststack1"
+                    },
+                    {
+                        "name": "testorg1/testproj2/teststack2",
+                        "current": false,
+                        "url": "https://app.pulumi.com/testorg1/testproj2/teststack2"
+                    }
+                ]`;
+            it(`should handle stacks correctly for listStacks when all is set`, async () => {
+                const mockWithReturnedStacks = {
+                    command: "pulumi",
+                    version: null,
+                    run: async () => new CommandResult(stackJson, "", 0),
+                };
+                const workspace = await LocalWorkspace.create(
+                    withTestBackend({
+                        pulumiCommand: mockWithReturnedStacks,
+                    }),
+                );
+                const stacks = await workspace.listStacks({ all: true });
+                assert.strictEqual(stacks.length, 2);
+                assert.strictEqual(stacks[0].name, "testorg1/testproj1/teststack1");
+                assert.strictEqual(stacks[0].current, false);
+                assert.strictEqual(stacks[0].url, "https://app.pulumi.com/testorg1/testproj1/teststack1");
+                assert.strictEqual(stacks[1].name, "testorg1/testproj2/teststack2");
+                assert.strictEqual(stacks[1].current, false);
+                assert.strictEqual(stacks[1].url, "https://app.pulumi.com/testorg1/testproj2/teststack2");
+            });
+
+            it(`should use correct args for listStacks when all is set`, async () => {
+                let capturedArgs: string[] = [];
+                const mockPuluiCommand = {
+                    command: "pulumi",
+                    version: null,
+                    run: async (args: string[], cwd: string, additionalEnv: { [key: string]: string }) => {
+                        capturedArgs = args;
+                        return new CommandResult(stackJson, "", 0);
+                    },
+                };
+                const workspace = await LocalWorkspace.create(
+                    withTestBackend({
+                        pulumiCommand: mockPuluiCommand,
+                    }),
+                );
+                await workspace.listStacks({ all: true });
+                assert.deepStrictEqual(capturedArgs, ["stack", "ls", "--json", "--all"]);
+            });
+        });
+    });
+    it(`Environment functions`, async function () {
+        // Skipping test because the required environments are in the moolumi org.
+        if (getTestOrg() !== "moolumi") {
+            this.skip();
+            return;
+        }
+        const projectName = "node_env_test";
+        const projectSettings: ProjectSettings = {
+            name: projectName,
+            runtime: "nodejs",
+        };
+        const ws = await LocalWorkspace.create(withTestBackend({ projectSettings }));
+        const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
+        const stack = await Stack.create(stackName, ws);
+
+        // Adding non-existent env should fail.
+        await assert.rejects(
+            stack.addEnvironments("non-existent-env"),
+            "stack.addEnvironments('non-existent-env') did not reject",
+        );
+
+        // Adding existing envs should succeed.
+        await stack.addEnvironments("automation-api-test-env", "automation-api-test-env-2");
+
+        let envs = await stack.listEnvironments();
+        assert.deepStrictEqual(envs, ["automation-api-test-env", "automation-api-test-env-2"]);
+
+        const config = await stack.getAllConfig();
+        assert.strictEqual(config["node_env_test:new_key"].value, "test_value");
+        assert.strictEqual(config["node_env_test:also"].value, "business");
+
+        // Removing existing env should succeed.
+        await stack.removeEnvironment("automation-api-test-env");
+        envs = await stack.listEnvironments();
+        assert.deepStrictEqual(envs, ["automation-api-test-env-2"]);
+
+        const alsoConfig = await stack.getConfig("also");
+        assert.strictEqual(alsoConfig.value, "business");
+        await assert.rejects(stack.getConfig("new_key"), "stack.getConfig('new_key') did not reject");
+
+        await stack.removeEnvironment("automation-api-test-env-2");
+        envs = await stack.listEnvironments();
+        assert.strictEqual(envs.length, 0);
+        await assert.rejects(stack.getConfig("also"), "stack.getConfig('also') did not reject");
+
+        await ws.removeStack(stackName);
+    });
     it(`Config`, async () => {
         const projectName = "node_test";
         const projectSettings: ProjectSettings = {
             name: projectName,
             runtime: "nodejs",
         };
-        const ws = await LocalWorkspace.create({ projectSettings });
+        const ws = await LocalWorkspace.create(withTestBackend({ projectSettings }));
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
         const stack = await Stack.create(stackName, ws);
 
@@ -177,19 +380,19 @@ describe("LocalWorkspace", () => {
             name: projectName,
             runtime: "nodejs",
         };
-        const ws = await LocalWorkspace.create({ projectSettings });
+        const ws = await LocalWorkspace.create(withTestBackend({ projectSettings }));
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
         const stack = await Stack.create(stackName, ws);
-        await stack.setConfig("key", {value: "-value"});
-        await stack.setConfig("secret-key", {value: "-value", secret: true});
+        await stack.setConfig("key", { value: "-value" });
+        await stack.setConfig("secret-key", { value: "-value", secret: true });
         const values = await stack.getAllConfig();
         assert.strictEqual(values["config_flag_like:key"].value, "-value");
         assert.strictEqual(values["config_flag_like:key"].secret, false);
         assert.strictEqual(values["config_flag_like:secret-key"].value, "-value");
         assert.strictEqual(values["config_flag_like:secret-key"].secret, true);
         await stack.setAllConfig({
-            "key": {value: "-value2"},
-            "secret-key": {value: "-value2", secret: true},
+            key: { value: "-value2" },
+            "secret-key": { value: "-value2", secret: true },
         });
         const values2 = await stack.getAllConfig();
         assert.strictEqual(values2["config_flag_like:key"].value, "-value2");
@@ -197,30 +400,121 @@ describe("LocalWorkspace", () => {
         assert.strictEqual(values2["config_flag_like:secret-key"].value, "-value2");
         assert.strictEqual(values2["config_flag_like:secret-key"].secret, true);
     });
+    it(`Config path`, async () => {
+        const projectName = "node_test";
+        const projectSettings: ProjectSettings = {
+            name: projectName,
+            runtime: "nodejs",
+        };
+        const ws = await LocalWorkspace.create(withTestBackend({ projectSettings }));
+        const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
+        const stack = await Stack.create(stackName, ws);
+
+        // test backward compatibility
+        await stack.setConfig("key1", { value: "value1" });
+        // test new flag without subPath
+        await stack.setConfig("key2", { value: "value2" }, false);
+        // test new flag with subPath
+        await stack.setConfig("key3.subKey1", { value: "value3" }, true);
+        // test secret
+        await stack.setConfig("key4", { value: "value4", secret: true });
+        // test subPath and key as secret
+        await stack.setConfig("key5.subKey1", { value: "value5", secret: true }, true);
+        // test string with dots
+        await stack.setConfig("key6.subKey1", { value: "value6", secret: true });
+        // test string with dots
+        await stack.setConfig("key7.subKey1", { value: "value7", secret: true }, false);
+        // test subPath
+        await stack.setConfig("key7.subKey2", { value: "value8" }, true);
+        // test subPath
+        await stack.setConfig("key7.subKey3", { value: "value9" }, true);
+
+        // test backward compatibility
+        const cv1 = await stack.getConfig("key1");
+        assert.strictEqual(cv1.value, "value1");
+        assert.strictEqual(cv1.secret, false);
+
+        // test new flag without subPath
+        const cv2 = await stack.getConfig("key2", false);
+        assert.strictEqual(cv2.value, "value2");
+        assert.strictEqual(cv2.secret, false);
+
+        // test new flag with subPath
+        const cv3 = await stack.getConfig("key3.subKey1", true);
+        assert.strictEqual(cv3.value, "value3");
+        assert.strictEqual(cv3.secret, false);
+
+        // test secret
+        const cv4 = await stack.getConfig("key4");
+        assert.strictEqual(cv4.value, "value4");
+        assert.strictEqual(cv4.secret, true);
+
+        // test subPath and key as secret
+        const cv5 = await stack.getConfig("key5.subKey1", true);
+        assert.strictEqual(cv5.value, "value5");
+        assert.strictEqual(cv5.secret, true);
+
+        // test string with dots
+        const cv6 = await stack.getConfig("key6.subKey1");
+        assert.strictEqual(cv6.value, "value6");
+        assert.strictEqual(cv6.secret, true);
+
+        // test string with dots
+        const cv7 = await stack.getConfig("key7.subKey1", false);
+        assert.strictEqual(cv7.value, "value7");
+        assert.strictEqual(cv7.secret, true);
+
+        // test string with dots
+        const cv8 = await stack.getConfig("key7.subKey2", true);
+        assert.strictEqual(cv8.value, "value8");
+        assert.strictEqual(cv8.secret, false);
+
+        // test string with dots
+        const cv9 = await stack.getConfig("key7.subKey3", true);
+        assert.strictEqual(cv9.value, "value9");
+        assert.strictEqual(cv9.secret, false);
+
+        await stack.removeConfig("key1");
+        await stack.removeConfig("key2", false);
+        await stack.removeConfig("key3", false);
+        await stack.removeConfig("key4", false);
+        await stack.removeConfig("key5", false);
+        await stack.removeConfig("key6.subKey1", false);
+        await stack.removeConfig("key7.subKey1", false);
+
+        const cfg = await stack.getAllConfig();
+        assert.strictEqual(cfg["node_test:key7"].value, '{"subKey2":"value8","subKey3":"value9"}');
+
+        await ws.removeStack(stackName);
+    });
+    // This test requires the existence of a Pulumi.dev.yaml file because we are reading the nested
+    // config from the file. This means we can't remove the stack at the end of the test.
+    // We should also not include secrets in this config, because the secret encryption is only valid within
+    // the context of a stack and org, and running this test in different orgs will fail if there are secrets.
     it(`nested_config`, async () => {
-        if (getTestOrg() !== "pulumi-test") {
-            return;
-        }
         const stackName = fullyQualifiedStackName(getTestOrg(), "nested_config", "dev");
         const workDir = upath.joinSafe(__dirname, "data", "nested_config");
-        const stack = await LocalWorkspace.createOrSelectStack({ stackName, workDir });
+        const stack = await LocalWorkspace.createOrSelectStack(
+            { stackName, workDir },
+            withTestBackend({}, "nested_config"),
+        );
 
         const allConfig = await stack.getAllConfig();
         const outerVal = allConfig["nested_config:outer"];
-        assert.strictEqual(outerVal.secret, true);
-        assert.strictEqual(outerVal.value, "{\"inner\":\"my_secret\",\"other\":\"something_else\"}");
+        assert.strictEqual(outerVal.secret, false);
+        assert.strictEqual(outerVal.value, '{"inner":"my_value","other":"something_else"}');
 
         const listVal = allConfig["nested_config:myList"];
         assert.strictEqual(listVal.secret, false);
-        assert.strictEqual(listVal.value, "[\"one\",\"two\",\"three\"]");
+        assert.strictEqual(listVal.value, '["one","two","three"]');
 
         const outer = await stack.getConfig("outer");
-        assert.strictEqual(outer.secret, true);
-        assert.strictEqual(outer.value, "{\"inner\":\"my_secret\",\"other\":\"something_else\"}");
+        assert.strictEqual(outer.secret, false);
+        assert.strictEqual(outer.value, '{"inner":"my_value","other":"something_else"}');
 
         const list = await stack.getConfig("myList");
         assert.strictEqual(list.secret, false);
-        assert.strictEqual(list.value, "[\"one\",\"two\",\"three\"]");
+        assert.strictEqual(list.value, '["one","two","three"]');
     });
     it(`can list stacks and currently selected stack`, async () => {
         const projectName = `node_list_test${getTestSuffix()}`;
@@ -228,7 +522,7 @@ describe("LocalWorkspace", () => {
             name: projectName,
             runtime: "nodejs",
         };
-        const ws = await LocalWorkspace.create({ projectSettings });
+        const ws = await LocalWorkspace.create(withTestBackend({ projectSettings }));
         const stackNamer = () => `int_test${getTestSuffix()}`;
         const stackNames: string[] = [];
         for (let i = 0; i < 2; i++) {
@@ -245,30 +539,41 @@ describe("LocalWorkspace", () => {
             await ws.removeStack(name);
         }
     });
+    it(`returns valid whoami result`, async () => {
+        const projectName = "node_test";
+        const projectSettings: ProjectSettings = {
+            name: projectName,
+            runtime: "nodejs",
+        };
+        const ws = await LocalWorkspace.create(withTestBackend({ projectSettings }));
+        const whoAmIResult = await ws.whoAmI();
+        assert(whoAmIResult.user !== null);
+        assert(whoAmIResult.url !== null);
+    });
     it(`stack status methods`, async () => {
         const projectName = "node_test";
         const projectSettings: ProjectSettings = {
             name: projectName,
             runtime: "nodejs",
         };
-        const ws = await LocalWorkspace.create({ projectSettings });
+        const ws = await LocalWorkspace.create(withTestBackend({ projectSettings }));
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
         const stack = await Stack.create(stackName, ws);
         const history = await stack.history();
         assert.strictEqual(history.length, 0);
         const info = await stack.info();
-        assert.strictEqual(typeof (info), "undefined");
+        assert.strictEqual(typeof info, "undefined");
         await ws.removeStack(stackName);
     });
     // TODO[pulumi/pulumi#8220] understand why this test was flaky
     xit(`runs through the stack lifecycle with a local program`, async () => {
         const stackName = fullyQualifiedStackName(getTestOrg(), "testproj", `int_test${getTestSuffix()}`);
         const workDir = upath.joinSafe(__dirname, "data", "testproj");
-        const stack = await LocalWorkspace.createStack({ stackName, workDir });
+        const stack = await LocalWorkspace.createStack({ stackName, workDir }, withTestBackend({}));
 
         const config: ConfigMap = {
-            "bar": { value: "abc" },
-            "buzz": { value: "secret", secret: true },
+            bar: { value: "abc" },
+            buzz: { value: "secret", secret: true },
         };
         await stack.setAllConfig(config);
 
@@ -303,7 +608,10 @@ describe("LocalWorkspace", () => {
     it(`runs through the stack lifecycle with a local dotnet program`, async () => {
         const stackName = fullyQualifiedStackName(getTestOrg(), "testproj_dotnet", `int_test${getTestSuffix()}`);
         const workDir = upath.joinSafe(__dirname, "data", "testproj_dotnet");
-        const stack = await LocalWorkspace.createStack({ stackName, workDir });
+        const stack = await LocalWorkspace.createStack(
+            { stackName, workDir },
+            withTestBackend({}, "testproj_dotnet", "", "dotnet"),
+        );
 
         // pulumi up
         const upRes = await stack.up({ userAgent });
@@ -340,11 +648,14 @@ describe("LocalWorkspace", () => {
         };
         const projectName = "inline_node";
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
-        const stack = await LocalWorkspace.createStack({ stackName, projectName, program });
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
 
         const stackConfig: ConfigMap = {
-            "bar": { value: "abc" },
-            "buzz": { value: "secret", secret: true },
+            bar: { value: "abc" },
+            buzz: { value: "secret", secret: true },
         };
         await stack.setAllConfig(stackConfig);
 
@@ -376,6 +687,204 @@ describe("LocalWorkspace", () => {
 
         await stack.workspace.removeStack(stackName);
     });
+    it(`runs through the stack lifecycle with an inline program, testing removing without destroying`, async () => {
+        const program = async () => {
+            class MyResource extends ComponentResource {
+                constructor(name: string, opts?: ComponentResourceOptions) {
+                    super("my:module:MyResource", name, {}, opts);
+                }
+            }
+            new MyResource("res");
+            return {};
+        };
+        const projectName = "inline_node";
+        const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
+
+        await stack.up({ userAgent });
+
+        // we shouldn't be able to remove the stack without force
+        // since the stack has an active resource
+        assert.rejects(stack.workspace.removeStack(stackName));
+
+        await stack.workspace.removeStack(stackName, { force: true });
+
+        // we shouldn't be able to select the stack after it's been removed
+        // we expect this error
+        assert.rejects(stack.workspace.selectStack(stackName));
+    });
+    it("runs through the stack lifecycle with an inline program, testing destroy with --remove", async () => {
+        // Arrange.
+        const program = async () => {
+            class MyResource extends ComponentResource {
+                constructor(name: string, opts?: ComponentResourceOptions) {
+                    super("my:module:MyResource", name, {}, opts);
+                }
+            }
+            new MyResource("res");
+            return {};
+        };
+        const projectName = "inline_node";
+        const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
+
+        await stack.up({ userAgent });
+
+        // Act.
+        await stack.destroy({ userAgent, remove: true });
+
+        // Assert.
+        await assert.rejects(stack.workspace.selectStack(stackName));
+    });
+    // Regression test for https://github.com/pulumi/pulumi/issues/17613
+    it(`does not hang on a failed input`, async function () {
+        this.timeout(20 * 1000); // This test hangs indefinitely if it fails
+
+        const program = async () => {
+            class MyResource extends CustomResource {
+                constructor(name: string, props: any) {
+                    super("test:index:MyResource", name, props);
+                }
+            }
+
+            const failedInput = output(Promise.reject("input rejected"));
+
+            new MyResource("testResource1", {
+                failingInput: failedInput,
+            });
+        };
+        const projectName = "inline_node";
+        const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `auto_test${getTestSuffix()}`);
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
+
+        await assert.rejects(stack.up(), /input rejected/);
+
+        await stack.destroy();
+    });
+    it(`renames a stack`, async () => {
+        const program = async () => {
+            class MyResource extends ComponentResource {
+                constructor(name: string, opts?: ComponentResourceOptions) {
+                    super("my:module:MyResource", name, {}, opts);
+                }
+            }
+            new MyResource("res");
+            return {};
+        };
+
+        const suffix = `int_test${getTestSuffix()}`;
+
+        const stackName = fullyQualifiedStackName(getTestOrg(), "inline_node", suffix);
+        const shortName = getTestOrg() + "/" + suffix;
+
+        const stackRenamed = stackName + "_renamed";
+        const shortRenamed = shortName + "_renamed";
+
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName: "inline_node", program },
+            withTestBackend({}, "inline_node"),
+        );
+
+        await stack.up({ userAgent });
+        stack.workspace.selectStack(stackName);
+
+        let returned = "";
+        const renameRes = await stack.rename({
+            stackName: stackRenamed,
+            onOutput: (e) => {
+                returned += e;
+            },
+        });
+
+        const after = (await stack.workspace.listStacks()).find((x) => x.name.startsWith(shortName));
+
+        assert.strictEqual(returned, `Renamed ${shortName} to ${shortRenamed}\n`);
+        assert.strictEqual(after?.name, shortRenamed);
+
+        assert.strictEqual(renameRes.summary.kind, "rename");
+        assert.strictEqual(renameRes.summary.result, "succeeded");
+
+        // pulumi destroy
+        const destroyRes = await stack.destroy({ userAgent });
+        assert.strictEqual(destroyRes.summary.kind, "destroy");
+        assert.strictEqual(destroyRes.summary.result, "succeeded");
+    });
+    it(`refreshes with refresh option`, async () => {
+        // We create a simple program, and scan the output for an indication
+        // that adding refresh: true will perfrom a refresh operation.
+        const program = async () => {
+            return {
+                toggle: true,
+            };
+        };
+        const projectName = "inline_node";
+        const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
+        // • First, run Up so we can set the initial state.
+        await stack.up({ userAgent });
+        // • Next, run preview with refresh and check that the refresh was performed.
+        const refresh = true;
+        const previewRes = await stack.preview({ userAgent, refresh });
+        assert.match(previewRes.stdout, /refreshing/);
+        assert.strictEqual(previewRes.changeSummary.same, 1, "preview expected 1 same (the stack)");
+
+        const upRes = await stack.up({ userAgent, refresh });
+        assert.match(upRes.stdout, /refreshing/);
+
+        const destroyRes = await stack.destroy({ userAgent, refresh });
+        assert.match(destroyRes.stdout, /refreshing/);
+    });
+    it(`destroys an inline program with excludeProtected`, async () => {
+        const program = async () => {
+            class MyResource extends ComponentResource {
+                constructor(name: string, opts?: ComponentResourceOptions) {
+                    super("my:module:MyResource", name, {}, opts);
+                }
+            }
+            const config = new Config();
+            const protect = config.getBoolean("protect") ?? false;
+            new MyResource("first", { protect });
+            new MyResource("second");
+            return {};
+        };
+        const projectName = "inline_node";
+        const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
+
+        // initial up
+        await stack.setConfig("protect", { value: "true" });
+        await stack.up({ userAgent });
+
+        // pulumi destroy
+        const destroyRes = await stack.destroy({ userAgent, excludeProtected: true });
+        assert.strictEqual(destroyRes.summary.kind, "destroy");
+        assert.strictEqual(destroyRes.summary.result, "succeeded");
+        assert.match(destroyRes.stdout, /All unprotected resources were destroyed/);
+
+        // unprotected resources
+        await stack.removeConfig("protect");
+        await stack.up({ userAgent });
+
+        // pulumi destroy to cleanup all resources
+        await stack.destroy({ userAgent });
+
+        await stack.workspace.removeStack(stackName);
+    });
     it(`successfully initializes multiple stacks`, async () => {
         const program = async () => {
             const config = new Config();
@@ -386,9 +895,15 @@ describe("LocalWorkspace", () => {
             };
         };
         const projectName = "inline_node";
-        const stackNames = Array.from(Array(10).keys()).map(_ => fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`));
-        const stacks = await Promise.all(stackNames.map(async stackName => LocalWorkspace.createStack({ stackName, projectName, program })));
-        await stacks.map(stack => stack.workspace.removeStack(stack.name));
+        const stackNames = Array.from(Array(10).keys()).map((_) =>
+            fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`),
+        );
+        const stacks = await Promise.all(
+            stackNames.map(async (stackName) =>
+                LocalWorkspace.createStack({ stackName, projectName, program }, withTestBackend({}, "inline_node")),
+            ),
+        );
+        await stacks.map((stack) => stack.workspace.removeStack(stack.name));
     });
     it(`runs through the stack lifecycle with multiple inline programs in parallel`, async () => {
         const program = async () => {
@@ -400,14 +915,19 @@ describe("LocalWorkspace", () => {
             };
         };
         const projectName = "inline_node";
-        const stackNames = Array.from(Array(10).keys()).map(_ => fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`));
+        const stackNames = Array.from(Array(30).keys()).map((_) =>
+            fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`),
+        );
 
         const testStackLifetime = async (stackName: string) => {
-            const stack = await LocalWorkspace.createStack({ stackName, projectName, program });
+            const stack = await LocalWorkspace.createStack(
+                { stackName, projectName, program },
+                withTestBackend({}, "inline_node"),
+            );
 
             const stackConfig: ConfigMap = {
-                "bar": { value: "abc" },
-                "buzz": { value: "secret", secret: true },
+                bar: { value: "abc" },
+                buzz: { value: "secret", secret: true },
             };
             await stack.setAllConfig(stackConfig);
 
@@ -439,8 +959,10 @@ describe("LocalWorkspace", () => {
 
             await stack.workspace.removeStack(stack.name);
         };
-
-        await Promise.all(stackNames.map(async stackName => await testStackLifetime(stackName)));
+        for (let i = 0; i < stackNames.length; i += 10) {
+            const chunk = stackNames.slice(i, i + 10);
+            await Promise.all(chunk.map(async (stackName) => await testStackLifetime(stackName)));
+        }
     });
     it(`handles events`, async () => {
         const program = async () => {
@@ -453,11 +975,14 @@ describe("LocalWorkspace", () => {
         };
         const projectName = "inline_node";
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
-        const stack = await LocalWorkspace.createStack({ stackName, projectName, program });
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
 
         const stackConfig: ConfigMap = {
-            "bar": { value: "abc" },
-            "buzz": { value: "secret", secret: true },
+            bar: { value: "abc" },
+            buzz: { value: "secret", secret: true },
         };
         await stack.setAllConfig(stackConfig);
 
@@ -550,41 +1075,44 @@ describe("LocalWorkspace", () => {
         };
         const projectName = "inline_node";
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
-        const stack = await LocalWorkspace.createStack({ stackName, projectName, program });
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
 
         const stackConfig: ConfigMap = {
-            "plainstr1": { value: "1" },
-            "plainstr2": { value: "2" },
-            "plainstr3": { value: "3" },
-            "plainstr4": { value: "4" },
-            "plainbool1": { value: "true" },
-            "plainbool2": { value: "true" },
-            "plainbool3": { value: "true" },
-            "plainbool4": { value: "true" },
-            "plainnum1": { value: "1" },
-            "plainnum2": { value: "2" },
-            "plainnum3": { value: "3" },
-            "plainnum4": { value: "4" },
-            "plainobj1": { value: "{}" },
-            "plainobj2": { value: "{}" },
-            "plainobj3": { value: "{}" },
-            "plainobj4": { value: "{}" },
-            "str1": { value: "1", secret: true },
-            "str2": { value: "2", secret: true },
-            "str3": { value: "3", secret: true },
-            "str4": { value: "4", secret: true },
-            "bool1": { value: "true", secret: true },
-            "bool2": { value: "true", secret: true },
-            "bool3": { value: "true", secret: true },
-            "bool4": { value: "true", secret: true },
-            "num1": { value: "1", secret: true },
-            "num2": { value: "2", secret: true },
-            "num3": { value: "3", secret: true },
-            "num4": { value: "4", secret: true },
-            "obj1": { value: "{}", secret: true },
-            "obj2": { value: "{}", secret: true },
-            "obj3": { value: "{}", secret: true },
-            "obj4": { value: "{}", secret: true },
+            plainstr1: { value: "1" },
+            plainstr2: { value: "2" },
+            plainstr3: { value: "3" },
+            plainstr4: { value: "4" },
+            plainbool1: { value: "true" },
+            plainbool2: { value: "true" },
+            plainbool3: { value: "true" },
+            plainbool4: { value: "true" },
+            plainnum1: { value: "1" },
+            plainnum2: { value: "2" },
+            plainnum3: { value: "3" },
+            plainnum4: { value: "4" },
+            plainobj1: { value: "{}" },
+            plainobj2: { value: "{}" },
+            plainobj3: { value: "{}" },
+            plainobj4: { value: "{}" },
+            str1: { value: "1", secret: true },
+            str2: { value: "2", secret: true },
+            str3: { value: "3", secret: true },
+            str4: { value: "4", secret: true },
+            bool1: { value: "true", secret: true },
+            bool2: { value: "true", secret: true },
+            bool3: { value: "true", secret: true },
+            bool4: { value: "true", secret: true },
+            num1: { value: "1", secret: true },
+            num2: { value: "2", secret: true },
+            num3: { value: "3", secret: true },
+            num4: { value: "4", secret: true },
+            obj1: { value: "{}", secret: true },
+            obj2: { value: "{}", secret: true },
+            obj3: { value: "{}", secret: true },
+            obj4: { value: "{}", secret: true },
         };
         await stack.setAllConfig(stackConfig);
 
@@ -647,8 +1175,11 @@ describe("LocalWorkspace", () => {
             }
             for (const unexpected of unexpectedWarnings) {
                 for (const warning of warnings) {
-                    assert.strictEqual(warning.includes(unexpected), false,
-                        `Unexpected '${unexpected}' found in warning`);
+                    assert.strictEqual(
+                        warning.includes(unexpected),
+                        false,
+                        `Unexpected '${unexpected}' found in warning`,
+                    );
                 }
             }
         };
@@ -675,12 +1206,15 @@ describe("LocalWorkspace", () => {
         };
         const projectName = "import_export_node";
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
-        const stack = await LocalWorkspace.createStack({ stackName, projectName, program });
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "import_export_node"),
+        );
 
         try {
             await stack.setAllConfig({
-                "bar": { value: "abc" },
-                "buzz": { value: "secret", secret: true },
+                bar: { value: "abc" },
+                buzz: { value: "secret", secret: true },
             });
             await stack.up();
 
@@ -710,7 +1244,10 @@ describe("LocalWorkspace", () => {
         };
         const projectName = "import_export_node";
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
-        const stack = await LocalWorkspace.createStack({ stackName, projectName, program });
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "import_export_node"),
+        );
 
         const assertOutputs = (outputs: OutputMap) => {
             assert.strictEqual(Object.keys(outputs).length, 3, "expected to have 3 outputs");
@@ -724,8 +1261,8 @@ describe("LocalWorkspace", () => {
 
         try {
             await stack.setAllConfig({
-                "bar": { value: "abc" },
-                "buzz": { value: "secret", secret: true },
+                bar: { value: "abc" },
+                buzz: { value: "secret", secret: true },
             });
 
             const initialOutputs = await stack.outputs();
@@ -750,6 +1287,25 @@ describe("LocalWorkspace", () => {
             await stack.workspace.removeStack(stackName);
         }
     });
+    it(`runs an inline program that exits gracefully`, async () => {
+        const program = async () => ({});
+        const projectName = "inline_node";
+        const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
+
+        // pulumi up
+        await assert.doesNotReject(stack.up());
+
+        // pulumi destroy
+        const destroyRes = await stack.destroy();
+        assert.strictEqual(destroyRes.summary.kind, "destroy");
+        assert.strictEqual(destroyRes.summary.result, "succeeded");
+
+        await stack.workspace.removeStack(stackName);
+    });
     it(`runs an inline program that rejects a promise and exits gracefully`, async () => {
         const program = async () => {
             Promise.reject(new Error());
@@ -757,7 +1313,10 @@ describe("LocalWorkspace", () => {
         };
         const projectName = "inline_node";
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
-        const stack = await LocalWorkspace.createStack({ stackName, projectName, program });
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
 
         // pulumi up
         await assert.rejects(stack.up());
@@ -769,30 +1328,27 @@ describe("LocalWorkspace", () => {
 
         await stack.workspace.removeStack(stackName);
     });
-    it(`detects inline programs with side by side pulumi and throws an error`, async () => {
-
+    it(`runs successfully after a previous failure`, async () => {
+        let shouldFail = true;
         const program = async () => {
-            // clear pulumi/pulumi from require cache
-            delete require.cache[require.resolve("../../runtime")];
-            delete require.cache[require.resolve("../../runtime/config")];
-            delete require.cache[require.resolve("../../runtime/settings")];
-            // load up a fresh instance of pulumi
-            const p1 = require("../../runtime/settings");
-            // do some work that happens to observe runtime options with the new instance
-            p1.monitorSupportsSecrets();
-            return {
-                // export an output from originally pulumi causing settings to be observed again (boom).
-                test: output("original_pulumi"),
-            };
+            if (shouldFail) {
+                Promise.reject(new Error());
+            }
+            return {};
         };
-        const projectName = "inline_node_sxs";
+        const projectName = "inline_node";
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
-        const stack = await LocalWorkspace.createStack({ stackName, projectName, program });
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
 
-        // pulumi up
-        await assert.rejects(stack.up(), (err: Error) => {
-            return err.stack!.indexOf("Detected multiple versions of '@pulumi/pulumi'") >= 0;
-        });
+        // pulumi up rejects the first time
+        await assert.rejects(stack.up());
+
+        // pulumi up succeeds the 2nd time
+        shouldFail = false;
+        await assert.doesNotReject(stack.up());
 
         // pulumi destroy
         const destroyRes = await stack.destroy();
@@ -801,17 +1357,149 @@ describe("LocalWorkspace", () => {
 
         await stack.workspace.removeStack(stackName);
     });
+
+    it("can import resources into a stack using resource definitions", async () => {
+        const workDir = upath.joinSafe(__dirname, "data", "import");
+        const stackName = fullyQualifiedStackName(getTestOrg(), "node_test", `int_test${getTestSuffix()}`);
+        const stack = await LocalWorkspace.createStack({ workDir, stackName }, withTestBackend({}));
+        const pulumiRandomVersion = "4.16.3";
+        await stack.workspace.installPlugin("random", pulumiRandomVersion);
+        const result = await stack.import({
+            protect: false,
+            resources: [
+                {
+                    type: "random:index/randomPassword:RandomPassword",
+                    name: "randomPassword",
+                    id: "supersecret",
+                },
+            ],
+        });
+        let kind = "resource-import";
+        if (process.env.PULUMI_ACCESS_TOKEN) {
+            // The service handles this slightly differently, and we just get "update" as "kind"
+            kind = "update";
+        }
+        assert.strictEqual(result.summary.kind, kind);
+        assert.strictEqual(result.summary.result, "succeeded");
+
+        const expectedGeneratedCode = fs.readFileSync(upath.joinSafe(workDir, "expected_generated_code.txt"), "utf8");
+        assert.strictEqual(result.generatedCode, expectedGeneratedCode);
+        await stack.destroy();
+        await stack.workspace.removeStack(stackName);
+        await stack.workspace.removePlugin("random", pulumiRandomVersion);
+    });
+
+    it("can import resources into a stack without generating code", async () => {
+        const workDir = upath.joinSafe(__dirname, "data", "import");
+        const stackName = fullyQualifiedStackName(getTestOrg(), "node_test", `int_test${getTestSuffix()}`);
+        const stack = await LocalWorkspace.createStack({ workDir, stackName }, withTestBackend({}));
+        const pulumiRandomVersion = "4.16.3";
+        await stack.workspace.installPlugin("random", pulumiRandomVersion);
+        const result = await stack.import({
+            protect: false,
+            generateCode: false,
+            resources: [
+                {
+                    type: "random:index/randomPassword:RandomPassword",
+                    name: "randomPassword",
+                    id: "supersecret",
+                },
+            ],
+        });
+        let kind = "resource-import";
+        if (process.env.PULUMI_ACCESS_TOKEN) {
+            // The service handles this slightly differently, and we just get "update" as "kind"
+            kind = "update";
+        }
+        assert.strictEqual(result.summary.kind, kind);
+        assert.strictEqual(result.summary.result, "succeeded");
+        assert.strictEqual(result.generatedCode, "");
+        await stack.destroy();
+        await stack.workspace.removeStack(stackName);
+        await stack.workspace.removePlugin("random", pulumiRandomVersion);
+    });
+
     it(`sets pulumi version`, async () => {
-        const ws = await LocalWorkspace.create({});
+        const ws = await LocalWorkspace.create(withTestBackend({}));
         assert(ws.pulumiVersion);
         assert.strictEqual(versionRegex.test(ws.pulumiVersion), true);
+    });
+    it("sets pulumi version when using a custom CLI instance", async () => {
+        const tmpDir = tmp.dirSync({ prefix: "automation-test-", unsafeCleanup: true });
+        try {
+            const cmd = await PulumiCommand.get();
+            const ws = await LocalWorkspace.create(withTestBackend({ pulumiCommand: cmd }));
+            assert.strictEqual(versionRegex.test(ws.pulumiVersion), true);
+        } finally {
+            tmpDir.removeCallback();
+        }
+    });
+    it("throws when attempting to retrieve an invalid pulumi version", async () => {
+        const mockWithNoVersion = {
+            command: "pulumi",
+            version: null,
+            run: async () => new CommandResult("some output", "", 0),
+        };
+        const ws = await LocalWorkspace.create(
+            withTestBackend({
+                pulumiCommand: mockWithNoVersion,
+                envVars: {
+                    PULUMI_AUTOMATION_API_SKIP_VERSION_CHECK: "true",
+                },
+            }),
+        );
+        assert.throws(() => ws.pulumiVersion);
+    });
+    it("fails creation if remote operation is not supported", async () => {
+        const mockWithNoRemoteSupport = {
+            command: "pulumi",
+            version: new semver.SemVer("2.0.0"),
+            // We inspect the output of `pulumi preview --help` to determine
+            // if the CLI supports remote operations, see
+            // `LocalWorkspace.checkRemoteSupport`.
+            run: async () => new CommandResult("some output", "", 0),
+        };
+        await assert.rejects(
+            LocalWorkspace.create(withTestBackend({ pulumiCommand: mockWithNoRemoteSupport, remote: true })),
+        );
+    });
+    it("bypasses remote support check", async () => {
+        const mockWithNoRemoteSupport = {
+            command: "pulumi",
+            version: new semver.SemVer("2.0.0"),
+            // We inspect the output of `pulumi preview --help` to determine
+            // if the CLI supports remote operations, see
+            // `LocalWorkspace.checkRemoteSupport`.
+            run: async () => new CommandResult("some output", "", 0),
+        };
+        await assert.doesNotReject(
+            LocalWorkspace.create(
+                withTestBackend({
+                    pulumiCommand: mockWithNoRemoteSupport,
+                    remote: true,
+                    envVars: {
+                        PULUMI_AUTOMATION_API_SKIP_VERSION_CHECK: "true",
+                    },
+                }),
+            ),
+        );
     });
     it(`respects existing project settings`, async () => {
         const projectName = "correct_project";
         const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
         const stack = await LocalWorkspace.createStack(
-            { stackName, projectName, program: async () => { return; } },
-            { workDir: upath.joinSafe(__dirname, "data", "correct_project") },
+            {
+                stackName,
+                projectName,
+                program: async () => {
+                    return;
+                },
+            },
+            withTestBackend(
+                { workDir: upath.joinSafe(__dirname, "data", "correct_project") },
+                "correct_project",
+                "This is a description",
+            ),
         );
         const projectSettings = await stack.workspace.projectSettings();
         assert.strictEqual(projectSettings.name, "correct_project");
@@ -821,7 +1509,9 @@ describe("LocalWorkspace", () => {
     });
     it(`correctly sets config on multiple stacks concurrently`, async () => {
         const dones = [];
-        const stacks = ["dev", "dev2", "dev3", "dev4", "dev5"];
+        const stacks = ["dev", "dev2", "dev3", "dev4", "dev5"].map((x) =>
+            fullyQualifiedStackName("organization", "concurrent-config", `int_test_${x}_${getTestSuffix()}`),
+        );
         const workDir = upath.joinSafe(__dirname, "data", "tcfg");
         const ws = await LocalWorkspace.create({
             workDir,
@@ -831,7 +1521,7 @@ describe("LocalWorkspace", () => {
                 backend: { url: "file://~" },
             },
             envVars: {
-                "PULUMI_CONFIG_PASSPHRASE": "test",
+                PULUMI_CONFIG_PASSPHRASE: "test",
             },
         });
         for (let i = 0; i < stacks.length; i++) {
@@ -840,11 +1530,13 @@ describe("LocalWorkspace", () => {
         for (let i = 0; i < stacks.length; i++) {
             const x = i;
             const s = stacks[i];
-            dones.push((async () => {
-                for (let j = 0; j < 20; j++) {
-                    await ws.setConfig(s, "var-" + j, { value: ((x * 20) + j).toString() });
-                }
-            })());
+            dones.push(
+                (async () => {
+                    for (let j = 0; j < 20; j++) {
+                        await ws.setConfig(s, "var-" + j, { value: (x * 20 + j).toString() });
+                    }
+                })(),
+            );
         }
         await Promise.all(dones);
 
@@ -858,99 +1550,117 @@ describe("LocalWorkspace", () => {
             await stack.workspace.removeStack(stacks[i]);
         }
     });
-});
 
-const MAJOR = /Major version mismatch./;
-const MINIMUM = /Minimum version requirement failed./;
-const PARSE = /Failed to parse/;
+    it(`runs the install command`, async () => {
+        let recordedArgs: string[] = [];
+        const mockCommand = {
+            command: "pulumi",
+            // Version high enough to support --use-language-version-tools
+            version: semver.parse("3.130.0"),
+            run: async (
+                args: string[],
+                cwd: string,
+                additionalEnv: { [key: string]: string },
+                onOutput?: (data: string) => void,
+            ): Promise<CommandResult> => {
+                recordedArgs = args;
+                return new CommandResult("some output", "", 0);
+            },
+        };
+        const ws = await LocalWorkspace.create(withTestBackend({ pulumiCommand: mockCommand }));
 
-describe(`checkVersionIsValid`, () => {
-    const versionTests = [
-        {
-            name: "higher_major",
-            currentVersion: "100.0.0",
-            expectError: MAJOR,
-            optOut: false,
-        },
-        {
-            name: "lower_major",
-            currentVersion: "1.0.0",
-            expectError: MINIMUM,
-            optOut: false,
-        },
-        {
-            name: "higher_minor",
-            currentVersion: "v2.22.0",
-            expectError: null,
-            optOut: false,
-        },
-        {
-            name: "lower_minor",
-            currentVersion: "v2.1.0",
-            expectError: MINIMUM,
-            optOut: false,
-        },
-        {
-            name: "equal_minor_higher_patch",
-            currentVersion: "v2.21.2",
-            expectError: null,
-            optOut: false,
-        },
-        {
-            name: "equal_minor_equal_patch",
-            currentVersion: "v2.21.1",
-            expectError: null,
-            optOut: false,
-        },
-        {
-            name: "equal_minor_lower_patch",
-            currentVersion: "v2.21.0",
-            expectError: MINIMUM,
-            optOut: false,
-        },
-        {
-            name: "equal_minor_equal_patch_prerelease",
-            // Note that prerelease < release so this case will error
-            currentVersion: "v2.21.1-alpha.1234",
-            expectError: MINIMUM,
-            optOut: false,
-        },
-        {
-            name: "opt_out_of_check_would_fail_otherwise",
-            currentVersion: "v2.20.0",
-            expectError: null,
-            optOut: true,
-        },
-        {
-            name: "opt_out_of_check_would_succeed_otherwise",
-            currentVersion: "v2.22.0",
-            expectError: null,
-            optOut: true,
-        },
-        {
-            name: "invalid_version",
-            currentVersion: "invalid",
-            expectError: PARSE,
-            optOut: false,
-        },
-        {
-            name: "invalid_version_opt_out",
-            currentVersion: "invalid",
-            expectError: null,
-            optOut: true,
-        },
-    ];
-    const minVersion = new semver.SemVer("v2.21.1");
+        await ws.install();
+        assert.deepStrictEqual(recordedArgs, ["install"]);
 
-    versionTests.forEach(test => {
-        it(`validates ${test.name} (${test.currentVersion})`, () => {
-            const validate = () => parseAndValidatePulumiVersion(minVersion, test.currentVersion, test.optOut);
-            if (test.expectError) {
-                assert.throws(validate, test.expectError);
-            } else {
-                assert.doesNotThrow(validate);
-            }
+        await ws.install({ noPlugins: true });
+        assert.deepStrictEqual(recordedArgs, ["install", "--no-plugins"]);
+
+        await ws.install({ noDependencies: true });
+        assert.deepStrictEqual(recordedArgs, ["install", "--no-dependencies"]);
+
+        await ws.install({ reinstall: true });
+        assert.deepStrictEqual(recordedArgs, ["install", "--reinstall"]);
+
+        await ws.install({ useLanguageVersionTools: true });
+        assert.deepStrictEqual(recordedArgs, ["install", "--use-language-version-tools"]);
+
+        await ws.install({
+            noDependencies: true,
+            noPlugins: true,
+            reinstall: true,
+            useLanguageVersionTools: true,
         });
+        assert.deepStrictEqual(recordedArgs, [
+            "install",
+            "--use-language-version-tools",
+            "--no-plugins",
+            "--no-dependencies",
+            "--reinstall",
+        ]);
+    });
+
+    it(`install requires version >= 3.91`, async () => {
+        const mockCommand = {
+            command: "pulumi",
+            version: semver.parse("3.90.0"),
+            run: async (
+                args: string[],
+                cwd: string,
+                additionalEnv: { [key: string]: string },
+                onOutput?: (data: string) => void,
+            ): Promise<CommandResult> => {
+                return new CommandResult("some output", "", 0);
+            },
+        };
+        const ws = await LocalWorkspace.create(withTestBackend({ pulumiCommand: mockCommand }));
+
+        assert.rejects(() => ws.install());
+    });
+
+    it(`install --use-language-version-tools requires version >= 3.130`, async () => {
+        const mockCommand = {
+            command: "pulumi",
+            version: semver.parse("3.129.0"),
+            run: async (
+                args: string[],
+                cwd: string,
+                additionalEnv: { [key: string]: string },
+                onOutput?: (data: string) => void,
+            ): Promise<CommandResult> => {
+                return new CommandResult("some output", "", 0);
+            },
+        };
+        const ws = await LocalWorkspace.create(withTestBackend({ pulumiCommand: mockCommand }));
+
+        assert.rejects(() => ws.install());
+    });
+
+    it("sends SIGINT when aborted", async () => {
+        const controller = new AbortController();
+        const program = async () => {
+            await new Promise((f) => setTimeout(f, 60000));
+            return {};
+        };
+        const projectName = "inline_node";
+        const stackName = fullyQualifiedStackName(getTestOrg(), projectName, `int_test${getTestSuffix()}`);
+        const stack = await LocalWorkspace.createStack(
+            { stackName, projectName, program },
+            withTestBackend({}, "inline_node"),
+        );
+
+        new Promise((f) => setTimeout(f, 500)).then(() => controller.abort());
+        try {
+            // pulumi preview
+            const previewRes = await stack.preview({
+                signal: controller.signal,
+            });
+            assert.fail("expected canceled preview to throw");
+        } catch (err) {
+            assert.match(err.toString(), /stderr: Command was killed with SIGINT|error: preview canceled/);
+            assert.match(err.toString(), /CommandError: code: -2/);
+        }
+
+        await stack.workspace.removeStack(stackName);
     });
 });
 
@@ -961,3 +1671,103 @@ const normalizeConfigKey = (key: string, projectName: string) => {
     }
     return "";
 };
+
+/**
+ * Augments the provided {@link LocalWorkspaceOptions} so that they reference a
+ * either a file backend or a cloud backend, depending on whether PULUMI_ACCESS_TOKEN
+ * is set in the environment.
+ */
+function withTestBackend(
+    opts?: LocalWorkspaceOptions,
+    name?: string,
+    description?: string,
+    runtime?: string,
+): LocalWorkspaceOptions {
+    if (process.env.PULUMI_ACCESS_TOKEN) {
+        return withCloudBackend(opts, name, description, runtime);
+    }
+    return withTemporaryFileBackend(opts, name, description, runtime);
+}
+
+function withCloudBackend(
+    opts?: LocalWorkspaceOptions,
+    name?: string,
+    description?: string,
+    runtime?: string,
+): LocalWorkspaceOptions {
+    const backend = {
+        url: "https://api.pulumi.com",
+    };
+    if (name === undefined) {
+        name = "node_test";
+    }
+    if (runtime === undefined) {
+        runtime = "nodejs";
+    }
+    return {
+        ...opts,
+        projectSettings: {
+            // We are obliged to provide a name and runtime if we provide project
+            // settings, so we do so, but we spread in the provided project settings
+            // afterwards so that the caller can override them if need be.
+            name: name,
+            runtime: runtime as ProjectRuntime,
+            description: description,
+
+            ...opts?.projectSettings,
+            backend,
+        },
+    };
+}
+
+function withTemporaryFileBackend(
+    opts?: LocalWorkspaceOptions,
+    name?: string,
+    description?: string,
+    runtime?: string,
+): LocalWorkspaceOptions {
+    const tmpDir = tmp.dirSync({
+        prefix: "nodejs-tests-automation-",
+        unsafeCleanup: true,
+    });
+
+    const backend = { url: `file://${tmpDir.name}` };
+
+    if (name === undefined) {
+        name = "node_test";
+    }
+    if (runtime === undefined) {
+        runtime = "nodejs";
+    }
+
+    return withTestConfigPassphrase({
+        ...opts,
+        pulumiHome: tmpDir.name,
+        projectSettings: {
+            // We are obliged to provide a name and runtime if we provide project
+            // settings, so we do so, but we spread in the provided project settings
+            // afterwards so that the caller can override them if need be.
+            name: name,
+            runtime: runtime as ProjectRuntime,
+            description: description,
+
+            ...opts?.projectSettings,
+            backend,
+        },
+    });
+}
+
+/**
+ * Augments the provided {@link LocalWorkspaceOptions} so that they set up an
+ * environment containing a test `PULUMI_CONFIG_PASSPHRASE` variable suitable
+ * for use with a local file backend.
+ */
+function withTestConfigPassphrase(opts?: LocalWorkspaceOptions): LocalWorkspaceOptions {
+    return {
+        ...opts,
+        envVars: {
+            ...opts?.envVars,
+            PULUMI_CONFIG_PASSPHRASE: "test",
+        },
+    };
+}

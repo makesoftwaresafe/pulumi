@@ -18,28 +18,37 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/events"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/optremotepreview"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	ptesting "github.com/pulumi/pulumi/sdk/v3/go/common/testing"
 )
 
-const remoteTestRepo = "https://github.com/pulumi/test-repo.git"
+const (
+	remoteTestRepo       = "https://github.com/pulumi/test-repo.git"
+	remoteTestRepoBranch = "refs/heads/master"
+)
 
 func testRemoteStackGitSourceErrors(t *testing.T, fn func(ctx context.Context, stackName string, repo GitRepo,
-	opts ...RemoteWorkspaceOption) (RemoteStack, error)) {
-
+	opts ...RemoteWorkspaceOption) (RemoteStack, error),
+) {
 	ctx := context.Background()
 
 	const stack = "owner/project/stack"
 
 	tests := map[string]struct {
-		stack string
-		repo  GitRepo
-		err   string
+		stack           string
+		repo            GitRepo
+		executorImage   *ExecutorImage
+		err             string
+		inheritSettings bool
 	}{
 		"stack empty": {
 			stack: "",
@@ -70,19 +79,20 @@ func testRemoteStackGitSourceErrors(t *testing.T, fn func(ctx context.Context, s
 			err:   `stack name "owner/project/stack/wat" must be fully qualified`,
 		},
 		"repo setup": {
-			stack: stack,
-			repo:  GitRepo{Setup: func(context.Context, Workspace) error { return nil }},
-			err:   "repo.Setup cannot be used with remote workspaces",
+			stack:           stack,
+			repo:            GitRepo{Setup: func(context.Context, Workspace) error { return nil }},
+			inheritSettings: true,
+			err:             "repo.Setup cannot be used with remote workspaces",
 		},
 		"no url": {
 			stack: stack,
 			repo:  GitRepo{},
-			err:   "repo.URL is required",
+			err:   "repo.URL is required if RemoteInheritSettings(true) is not set",
 		},
 		"no branch or commit": {
 			stack: stack,
 			repo:  GitRepo{URL: remoteTestRepo},
-			err:   "either repo.Branch or repo.CommitHash is required",
+			err:   "either repo.Branch or repo.CommitHash is required if RemoteInheritSettings(true) is not set",
 		},
 		"both branch and commit": {
 			stack: stack,
@@ -98,6 +108,48 @@ func testRemoteStackGitSourceErrors(t *testing.T, fn func(ctx context.Context, s
 			},
 			err: "repo.Auth.SSHPrivateKey and repo.Auth.SSHPrivateKeyPath cannot both be specified",
 		},
+		"executor creds with no image": {
+			stack: stack,
+			repo: GitRepo{
+				URL:    remoteTestRepo,
+				Branch: "branch",
+			},
+			executorImage: &ExecutorImage{
+				Credentials: &DockerImageCredentials{
+					Username: "user",
+					Password: "password",
+				},
+			},
+			err: "executorImage.Image cannot be empty",
+		},
+		"executor image with username and no password": {
+			stack: stack,
+			repo: GitRepo{
+				URL:    remoteTestRepo,
+				Branch: "branch",
+			},
+			executorImage: &ExecutorImage{
+				Image: "image",
+				Credentials: &DockerImageCredentials{
+					Username: "username",
+				},
+			},
+			err: "executorImage.Credentials.Password cannot be empty",
+		},
+		"executor image with password and no username": {
+			stack: stack,
+			repo: GitRepo{
+				URL:    remoteTestRepo,
+				Branch: "branch",
+			},
+			executorImage: &ExecutorImage{
+				Image: "image",
+				Credentials: &DockerImageCredentials{
+					Password: "password",
+				},
+			},
+			err: "executorImage.Credentials.Username cannot be empty",
+		},
 	}
 
 	for name, tc := range tests {
@@ -105,15 +157,35 @@ func testRemoteStackGitSourceErrors(t *testing.T, fn func(ctx context.Context, s
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := fn(ctx, tc.stack, tc.repo)
+			_, err := fn(ctx, tc.stack, tc.repo, RemoteExecutorImage(tc.executorImage),
+				RemoteInheritSettings(tc.inheritSettings))
 			assert.EqualError(t, err, tc.err)
 		})
 	}
 }
 
-func testRemoteStackGitSource(t *testing.T, fn func(ctx context.Context, stackName string, repo GitRepo,
-	opts ...RemoteWorkspaceOption) (RemoteStack, error)) {
+// fetchCommitHash runs `git ls-remote URL branch` to determine the latest commit for the given repo
+// URL and branch.
+func fetchCommitHash(url, branch string) (string, error) {
+	cmd := exec.Command("git", "ls-remote", url, branch)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git ls-remote: %w", err)
+	}
+	out := strings.TrimSpace(string(output))
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return "", fmt.Errorf("could not determine commit hash from %q", out)
+	}
+	return fields[0], nil
+}
 
+func testRemoteStackGitSource(
+	t *testing.T,
+	fn func(ctx context.Context, stackName string, repo GitRepo, opts ...RemoteWorkspaceOption) (RemoteStack, error),
+	useCommitHash bool,
+	useExecutorImage bool,
+) {
 	// This test requires the service with access to Pulumi Deployments.
 	// Set PULUMI_ACCESS_TOKEN to an access token with access to Pulumi Deployments
 	// and set PULUMI_TEST_DEPLOYMENTS_API to any value to enable the test.
@@ -126,20 +198,35 @@ func testRemoteStackGitSource(t *testing.T, fn func(ctx context.Context, stackNa
 
 	ctx := context.Background()
 	pName := "go_remote_proj"
-	sName := randomStackName()
+	sName := ptesting.RandomStackName()
 	stackName := FullyQualifiedStackName(pulumiOrg, pName, sName)
 	repo := GitRepo{
 		URL:         remoteTestRepo,
-		Branch:      "refs/heads/master",
 		ProjectPath: "goproj",
+	}
+	var executorImage *ExecutorImage
+	if useCommitHash {
+		commitHash, err := fetchCommitHash(remoteTestRepo, remoteTestRepoBranch)
+		require.NoError(t, err)
+		repo.CommitHash = commitHash
+	} else {
+		repo.Branch = remoteTestRepoBranch
+	}
+
+	if useExecutorImage {
+		executorImage = &ExecutorImage{
+			Image: "pulumi/pulumi",
+		}
 	}
 
 	// initialize
 	s, err := fn(ctx, stackName, repo,
 		RemotePreRunCommands(
-			fmt.Sprintf("pulumi config set bar abc --stack %s", stackName),
-			fmt.Sprintf("pulumi config set --secret buzz secret --stack %s", stackName)),
-		RemoteSkipInstallDependencies(true))
+			"pulumi config set bar abc --stack "+stackName,
+			"pulumi config set --secret buzz secret --stack "+stackName),
+		RemoteSkipInstallDependencies(true),
+		RemoteExecutorImage(executorImage),
+	)
 	if err != nil {
 		t.Errorf("failed to initialize stack, err: %v", err)
 		t.FailNow()
@@ -186,7 +273,6 @@ func testRemoteStackGitSource(t *testing.T, fn func(ctx context.Context, stackNa
 	// -- pulumi refresh --
 
 	ref, err := s.Refresh(ctx)
-
 	if err != nil {
 		t.Errorf("refresh failed, err: %v", err)
 		t.FailNow()
@@ -218,7 +304,7 @@ func TestNewRemoteStackGitSourceErrors(t *testing.T) {
 
 func TestNewRemoteStackGitSource(t *testing.T) {
 	t.Parallel()
-	testRemoteStackGitSource(t, NewRemoteStackGitSource)
+	testRemoteStackGitSource(t, NewRemoteStackGitSource, true /*useCommitHash*/, false /*useExecutorImage*/)
 }
 
 func TestUpsertRemoteStackGitSourceErrors(t *testing.T) {
@@ -228,7 +314,7 @@ func TestUpsertRemoteStackGitSourceErrors(t *testing.T) {
 
 func TestUpsertRemoteStackGitSource(t *testing.T) {
 	t.Parallel()
-	testRemoteStackGitSource(t, UpsertRemoteStackGitSource)
+	testRemoteStackGitSource(t, UpsertRemoteStackGitSource, false /*useCommitHash*/, true /*useExecutorImage*/)
 }
 
 func TestIsFullyQualifiedStackName(t *testing.T) {

@@ -64,7 +64,8 @@ func (t *OpaqueType) AssignableFrom(src Type) bool {
 }
 
 func (t *OpaqueType) conversionFromImpl(
-	src Type, unifying, checkUnsafe bool, seen map[Type]struct{}) (ConversionKind, lazyDiagnostics) {
+	src Type, unifying, checkUnsafe bool, seen map[Type]struct{},
+) (ConversionKind, lazyDiagnostics) {
 	return conversionFrom(t, src, unifying, seen, func() (ConversionKind, lazyDiagnostics) {
 		if constType, ok := src.(*ConstType); ok {
 			return t.conversionFrom(constType.Type, unifying, seen)
@@ -72,7 +73,7 @@ func (t *OpaqueType) conversionFromImpl(
 		switch {
 		case t == NumberType:
 			// src == NumberType is handled by t == src above
-			contract.Assert(src != NumberType)
+			contract.Assertf(src != NumberType, "unexpected number-to-number conversion")
 
 			cki, _ := IntType.conversionFromImpl(src, unifying, false, seen)
 			switch cki {
@@ -80,7 +81,7 @@ func (t *OpaqueType) conversionFromImpl(
 				return SafeConversion, nil
 			case UnsafeConversion:
 				return UnsafeConversion, nil
-			default:
+			case NoConversion:
 				if checkUnsafe {
 					if kind, _ := StringType.conversionFromImpl(src, unifying, false, seen); kind.Exists() {
 						return UnsafeConversion, nil
@@ -161,8 +162,13 @@ func NewOpaqueType(name string) *OpaqueType {
 	return &t
 }
 
-func (t *OpaqueType) Pretty() pretty.Formatter {
+func (t *OpaqueType) pretty(seenFormatters map[Type]pretty.Formatter) pretty.Formatter {
 	return pretty.FromStringer(t)
+}
+
+func (t *OpaqueType) Pretty() pretty.Formatter {
+	seenFormatters := map[Type]pretty.Formatter{}
+	return t.pretty(seenFormatters)
 }
 
 func (t *OpaqueType) string(_ map[Type]struct{}) string {

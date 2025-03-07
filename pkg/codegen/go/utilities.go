@@ -114,7 +114,7 @@ func makeSafeEnumName(name, typeName string) (string, error) {
 
 	// Add the type to the name to disambiguate constants used for enum values
 	if strings.Contains(safeName, "_") && !strings.HasPrefix(safeName, "_") {
-		safeName = fmt.Sprintf("_%s", safeName)
+		safeName = "_" + safeName
 	}
 
 	safeName = typeName + safeName
@@ -150,6 +150,6 @@ func fieldName(pkg *pkgContext, r *schema.Resource, p *schema.Property) string {
 	}
 
 	res := s + "_"
-	contract.Assert(!isReservedResourceField(name, res))
+	contract.Assertf(!isReservedResourceField(name, res), "Name %q is reserved on resource %q", name, res)
 	return res
 }

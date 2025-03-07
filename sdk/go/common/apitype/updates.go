@@ -50,7 +50,7 @@ type UpdateOptions struct {
 	LocalPolicyPackPaths []string            `json:"localPolicyPackPaths"`
 	Color                colors.Colorization `json:"color"`
 	DryRun               bool                `json:"dryRun"`
-	Parallel             int                 `json:"parallel"`
+	Parallel             int32               `json:"parallel"`
 	ShowConfig           bool                `json:"showConfig"`
 	ShowReplacementSteps bool                `json:"showReplacementSteps"`
 	ShowSames            bool                `json:"showNames"`
@@ -70,6 +70,32 @@ type UpdateMetadata struct {
 	Environment map[string]string `json:"environment"`
 }
 
+// EscEnvironmentMetadata describes the ESC Environments used in an update.
+type EscEnvironmentMetadata struct {
+	// This will be in the format of "[project/]name[@tag/version]"
+	ID string `json:"id"`
+}
+
+type MessageSeverity string
+
+const (
+	MessageSeverityWarning MessageSeverity = "warning"
+	MessageSeverityError   MessageSeverity = "error"
+	MessageSeverityInfo    MessageSeverity = "info"
+)
+
+// Message is a message from the backend to be displayed to the user.
+type Message struct {
+	// Severity is the severity of the message.
+	Severity MessageSeverity `json:"severity,omitempty"`
+	// Message is the message to display to the user.
+	Message string `json:"message"`
+}
+
+type AISettingsForUpdate struct {
+	CopilotIsEnabled bool `json:"copilotIsEnabled"`
+}
+
 // UpdateProgramResponse is the result of an update program request.
 type UpdateProgramResponse struct {
 	// UpdateID is the opaque identifier of the requested update. This value is needed to begin an update, as
@@ -78,6 +104,11 @@ type UpdateProgramResponse struct {
 
 	// RequiredPolicies is a list of required Policy Packs to run during the update.
 	RequiredPolicies []RequiredPolicy `json:"requiredPolicies,omitempty"`
+
+	// Messages is a list of messages that should be displayed to the user.
+	Messages []Message `json:"messages,omitempty"`
+
+	AISettings AISettingsForUpdate `json:"aiSettings,omitempty"`
 }
 
 // StartUpdateRequest requests that an update starts getting applied to a stack.

@@ -1,3 +1,17 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package gen
 
 import (
@@ -11,11 +25,15 @@ import (
 	"strings"
 	"testing"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/testing/test"
+	"github.com/pulumi/pulumi/pkg/v3/codegen/testing/utils"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/executable"
 )
 
@@ -65,13 +83,13 @@ func TestGeneratePackage(t *testing.T) {
 	t.Parallel()
 
 	generatePackage := func(tool string, pkg *schema.Package, files map[string][]byte) (map[string][]byte, error) {
-
 		for f := range files {
 			t.Logf("Ignoring extraFile %s", f)
 		}
 
-		return GeneratePackage(tool, pkg)
+		return GeneratePackage(tool, pkg, nil)
 	}
+
 	test.TestSDKCodegen(t, &test.SDKCodegenOptions{
 		Language:   "go",
 		GenPackage: generatePackage,
@@ -83,14 +101,46 @@ func TestGeneratePackage(t *testing.T) {
 	})
 }
 
+func readGoPackageInfo(schemaPath string) (*GoPackageInfo, error) {
+	f, err := os.Open(schemaPath)
+	if err != nil {
+		return nil, err
+	}
+	type language struct {
+		Go GoPackageInfo `json:"go"`
+	}
+	type model struct {
+		Language language `json:"language"`
+	}
+	var m model
+	if err := json.NewDecoder(f).Decode(&m); err != nil {
+		return nil, err
+	}
+	return &m.Language.Go, nil
+}
+
+// Decide the name of the Go module for a generated test.
+//
+// For example for this path:
+//
+// codeDir = "../testing/test/testdata/external-resource-schema/go/"
+//
+// We will generate "$codeDir/go.mod" using `external-resource-schema` as the module name so that it can compile
+// independently.
+//
+// This can be overwritten by setting ModulePath in GoPackageInfo in
+//
+//	jq .language.go.modulePath ${codeDir}../schema.json
 func inferModuleName(codeDir string) string {
-	// For example for this path:
-	//
-	// codeDir = "../testing/test/testdata/external-resource-schema/go/"
-	//
-	// We will generate "$codeDir/go.mod" using
-	// `external-resource-schema` as the module name so that it
-	// can compile independently.
+	schemaPath := filepath.Join(filepath.Dir(codeDir), "schema.json")
+	if gotSchema, err := test.PathExists(schemaPath); err == nil && gotSchema {
+		if info, err := readGoPackageInfo(schemaPath); err == nil {
+			if info.ModulePath != "" {
+				return info.ModulePath
+			}
+		}
+	}
+
 	return filepath.Base(filepath.Dir(codeDir))
 }
 
@@ -109,7 +159,7 @@ func typeCheckGeneratedPackage(t *testing.T, codeDir string) {
 		t.Logf("Found an existing go.mod, leaving as is")
 	} else {
 		test.RunCommand(t, "go_mod_init", codeDir, goExe, "mod", "init", inferModuleName(codeDir))
-		replacement := fmt.Sprintf("github.com/pulumi/pulumi/sdk/v3=%s", sdk)
+		replacement := "github.com/pulumi/pulumi/sdk/v3=" + sdk
 		test.RunCommand(t, "go_mod_edit", codeDir, goExe, "mod", "edit", "-replace", replacement)
 	}
 
@@ -121,7 +171,7 @@ func testGeneratedPackage(t *testing.T, codeDir string) {
 	goExe, err := executable.FindExecutable("go")
 	require.NoError(t, err)
 
-	test.RunCommand(t, "go-test", codeDir, goExe, "test", fmt.Sprintf("%s/...", inferModuleName(codeDir)))
+	test.RunCommand(t, "go-test", codeDir, goExe, "test", inferModuleName(codeDir)+"/...")
 }
 
 func TestGenerateTypeNames(t *testing.T) {
@@ -157,12 +207,63 @@ func readSchemaFile(file string) *schema.Package {
 	if err = json.Unmarshal(schemaBytes, &pkgSpec); err != nil {
 		panic(err)
 	}
-	pkg, err := schema.ImportSpec(pkgSpec, map[string]schema.Language{"go": Importer})
+	loader := schema.NewPluginLoader(utils.NewHost(testdataPath))
+	pkg, diags, err := schema.BindSpec(pkgSpec, loader)
 	if err != nil {
 		panic(err)
 	}
 
+	if diags.HasErrors() {
+		panic(diags.Error())
+	}
+
 	return pkg
+}
+
+func readYamlSchemaFile(file string) *schema.Package {
+	// Read in, decode, and import the schema.
+	schemaBytes, err := os.ReadFile(filepath.Join("..", "testing", "test", "testdata", file))
+	if err != nil {
+		panic(err)
+	}
+	var pkgSpec schema.PackageSpec
+	if err = yaml.Unmarshal(schemaBytes, &pkgSpec); err != nil {
+		panic(err)
+	}
+	loader := schema.NewPluginLoader(utils.NewHost(testdataPath))
+	pkg, diags, err := schema.BindSpec(pkgSpec, loader)
+	if err != nil {
+		panic(err)
+	}
+
+	if diags.HasErrors() {
+		panic(diags.Error())
+	}
+
+	return pkg
+}
+
+func TestLanguageResources(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range test.PulumiPulumiSDKTests {
+		test := test
+		t.Run(test.Directory, func(t *testing.T) {
+			t.Parallel()
+			var pkg *schema.Package
+			if test.Directory == "simple-yaml-schema" || test.Directory == "cyclic-types" {
+				pkg = readYamlSchemaFile(filepath.Join(test.Directory, "schema.yaml"))
+			} else {
+				pkg = readSchemaFile(filepath.Join(test.Directory, "schema.json"))
+			}
+
+			resources, err := LanguageResources("test", pkg)
+			for token, resource := range resources {
+				assert.Equal(t, tokenToName(token), resource.Name)
+			}
+			require.NoError(t, err)
+		})
+	}
 }
 
 // We test the naming/module structure of generated packages.
@@ -209,9 +310,9 @@ func TestPackageNaming(t *testing.T) {
 					RootPackageName: tt.rootPackageName,
 				},
 			}
-			files, err := GeneratePackage("test", schema)
+			files, err := GeneratePackage("test", schema, nil)
 			require.NoError(t, err)
-			ordering := make([]string, 0, len(files))
+			ordering := slice.Prealloc[string](len(files))
 			for k := range files {
 				ordering = append(ordering, k)
 			}
@@ -372,7 +473,7 @@ func TestGenHeader(t *testing.T) {
 
 	s := func() string {
 		b := &bytes.Buffer{}
-		pkg.genHeader(b, []string{"pkg1", "example.com/foo/123-foo"}, nil)
+		pkg.genHeader(b, []string{"pkg1", "example.com/foo/123-foo"}, nil, false /* isUtil */)
 		return b.String()
 	}()
 	assert.Equal(t, `// Code generated by a tool DO NOT EDIT.
@@ -403,6 +504,7 @@ loop:
 	}
 	assert.Truef(t, found, `Didn't find a line that complies with "%v"`, autogenerated)
 }
+
 func TestTitle(t *testing.T) {
 	t.Parallel()
 	assert := assert.New(t)
@@ -415,4 +517,112 @@ func TestTitle(t *testing.T) {
 	assert.Equal("WaldoThudFred", Title("waldo-ThudFred"))
 	assert.Equal("WaldoThud_Fred", Title("waldo-Thud_Fred"))
 	assert.Equal("WaldoThud_Fred", Title("waldo-thud_Fred"))
+	assert.Equal("WaldoThud_Fred", Title("$waldo-thud_Fred"))
+}
+
+func TestRegressTypeDuplicatesInChunking(t *testing.T) {
+	t.Parallel()
+	pkgSpec := schema.PackageSpec{
+		Name:      "test",
+		Version:   "0.0.1",
+		Resources: make(map[string]schema.ResourceSpec),
+		Types: map[string]schema.ComplexTypeSpec{
+			"test:index:PolicyStatusAutogenRules": {
+				ObjectTypeSpec: schema.ObjectTypeSpec{
+					Type: "object",
+					Properties: map[string]schema.PropertySpec{
+						"imageExtractors": {
+							TypeSpec: schema.TypeSpec{
+								Type: "object",
+								AdditionalProperties: &schema.TypeSpec{
+									Type: "array",
+									Items: &schema.TypeSpec{
+										Type: "object",
+										Ref:  "#/types/test:index:Im",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			"test:index:Im": {
+				ObjectTypeSpec: schema.ObjectTypeSpec{
+					Type: "object",
+					Properties: map[string]schema.PropertySpec{
+						"name": {TypeSpec: schema.TypeSpec{Type: "string"}},
+						"path": {TypeSpec: schema.TypeSpec{Type: "string"}},
+					},
+					Required: []string{"path"},
+				},
+			},
+		},
+	}
+
+	// Need to ref PolicyStatusAutogenRules in input position to trigger the code path.
+	pkgSpec.Resources["test:index:Res"] = schema.ResourceSpec{
+		InputProperties: map[string]schema.PropertySpec{
+			"a": {
+				TypeSpec: schema.TypeSpec{
+					Ref: "#/types/test:index:PolicyStatusAutogenRules",
+				},
+			},
+		},
+	}
+
+	// Need to have N>500 but N<1000 to obtain 2 chunks.
+	for i := 0; i < 750; i++ {
+		ttok := fmt.Sprintf("test:index:Typ%d", i)
+		pkgSpec.Types[ttok] = schema.ComplexTypeSpec{
+			ObjectTypeSpec: schema.ObjectTypeSpec{
+				Type:     "object",
+				Required: []string{"x"},
+				Properties: map[string]schema.PropertySpec{
+					"x": {TypeSpec: schema.TypeSpec{Type: "string"}},
+				},
+			},
+		}
+	}
+
+	loader := schema.NewPluginLoader(utils.NewHost(testdataPath))
+	pkg, diags, err := schema.BindSpec(pkgSpec, loader)
+	require.NoError(t, err)
+	t.Logf("%v", diags)
+	require.False(t, diags.HasErrors())
+
+	fs, err := GeneratePackage("tests", pkg, nil)
+	require.NoError(t, err)
+
+	for f := range fs {
+		t.Logf("Generated %v", f)
+	}
+
+	// Expect to see two chunked files (chunking at n=500).
+	assert.Contains(t, fs, "test/pulumiTypes.go")
+	assert.Contains(t, fs, "test/pulumiTypes1.go")
+	assert.NotContains(t, fs, "test/pulumiTypes2.go")
+
+	// The types defined in the chunks should be mutually exclusive.
+	typedefs := func(s string) []string {
+		var types []string
+		for _, line := range strings.Split(s, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "type") {
+				types = append(types, line)
+			}
+		}
+		sort.Strings(types)
+		return types
+	}
+
+	typedefs1 := typedefs(string(fs["test/pulumiTypes.go"]))
+	typedefs2 := typedefs(string(fs["test/pulumiTypes1.go"]))
+
+	for _, typ := range typedefs1 {
+		assert.NotContains(t, typedefs2, typ)
+	}
+
+	for _, typ := range typedefs2 {
+		assert.NotContains(t, typedefs1, typ)
+	}
 }
